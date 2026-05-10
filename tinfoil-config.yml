@@ -1,0 +1,25 @@
+cvm-version: 0.8.0
+cpus: 16
+memory: 65536
+gpus: 1
+
+containers:
+  - name: "benchbox"
+    # Updated automatically by .github/workflows/tinfoil-build.yml on each release.
+    image: "ghcr.io/tinfoilsh/model-benchbox@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder
+    runtime: nvidia
+    gpus: all
+    ipc: host
+    restart: always
+    secrets:
+      - GITHUB_TOKEN
+      - HF_TOKEN
+      - TINFOIL_API_KEY
+
+# The benchbox is accessed via debug-mode SSH, not over HTTPS. The shim block
+# is required by schema but never exercised — nothing is listening on port
+# 8000 inside the container.
+shim:
+  upstream-port: 8000
+  paths:
+    - /health
