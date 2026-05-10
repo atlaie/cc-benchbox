@@ -1,94 +1,59 @@
 # model-benchbox
 
-A deployable Tinfoil Container with vLLM benchmarking tools baked in. Use this instead of launching `confidential-debug-large` and running `model_devbench/setup.sh` to install everything by hand.
+vLLM benchmarking tools in a Tinfoil Container. Deploy in debug mode, SSH in, run benches against any OpenAI-compatible endpoint (or a local in-process engine on the attached GPU).
 
-## What's in the image
+## First deploy
 
-- `vllm[bench]` — `vllm bench {latency,serve,throughput}` subcommands
-- `guidellm` — vllm-project's recommended production benchmarking tool
-- `openai`, `httpx`, `pandas`, `datasets` — Python clients and result tooling
-- `git`, `gh`, `vim`, `tmux`, `jq`, `htop`, `curl`, `wget`, `openssh-*` — dev / diagnostic utilities
+1. **Cut a release.** Actions → **Tinfoil Container Build** → enter `v0.0.1` → run. ~5 min.
+2. **Set org secrets** in the [Tinfoil dashboard](https://dash.tinfoil.sh): `GITHUB_TOKEN`, `HF_TOKEN`, `TINFOIL_API_KEY`. Register your laptop SSH key under **SSH Keys**.
+3. **Deploy:**
 
-Base image: `vllm/vllm-openai:v0.20.2` (carries CUDA, drivers, vllm). The OpenAI-server entrypoint is overridden — the container runs `sleep infinity` and you SSH into it.
+   ```bash
+   tinfoil container create benchbox \
+       --repo tinfoilsh/model-benchbox --tag v0.0.1 --debug \
+       --ssh-key laptop \
+       --secret GITHUB_TOKEN --secret HF_TOKEN --secret TINFOIL_API_KEY
+   ```
 
-## Release flow
+   The SSH command appears on the dashboard card once status is `ready`.
 
-This repo follows the same two-step build-and-release pattern as `confidential-model-router`. Both workflows live in `.github/workflows/`:
+## Run an experiment
 
-- **`tinfoil-build.yml`** — `workflow_dispatch` with a `version` input. Builds the Docker image, pushes it to `ghcr.io/tinfoilsh/model-benchbox`, runs `tinfoilsh/update-container-action` to rewrite `tinfoil-config.yml` with the new digest and create the matching git tag, then triggers `tinfoil-release.yml`.
-- **`tinfoil-release.yml`** — `workflow_dispatch`, automatically invoked by `tinfoil-build.yml`. Runs `tinfoilsh/measure-image-action` against the tagged config and registers the release in the Sigstore transparency log.
-
-The flow is single-input: pick a version, run the build workflow, everything else is automatic.
-
-### Cutting a release
-
-1. Open Actions → **Tinfoil Container Build** → **Run workflow**.
-2. Enter a version (e.g. `v0.0.1`).
-3. The workflow builds the image, updates `tinfoil-config.yml` with the new digest, creates the tag, and chains to `tinfoil-release.yml`.
-
-### Updating the vLLM base image
-
-1. Bump `ARG VLLM_VERSION` in the `Dockerfile`.
-2. Commit and push to `main`.
-3. Run **Tinfoil Container Build** with a new version (e.g. `v0.0.2`).
-
-## Deploying
-
-Once a version is registered (the build workflow has finished and `tinfoil-release.yml` has succeeded), deploy via the dashboard or CLI:
+SSH lands in `/workspace`. Full workflow guidance is in [`CLAUDE.md`](./CLAUDE.md). Two starting points:
 
 ```bash
-tinfoil container create benchbox \
-    --repo tinfoilsh/model-benchbox \
-    --tag v0.0.1 \
-    --debug \
-    --ssh-key laptop \
-    --secret GITHUB_TOKEN \
-    --secret HF_TOKEN \
-    --secret TINFOIL_API_KEY
+# Quick check — vllm's built-in
+vllm bench serve --base-url https://<name>.<org>.containers.tinfoil.dev \
+    --model <served-model-name> --dataset-name sharegpt \
+    --num-prompts 100 --request-rate 5
 
-tinfoil container get benchbox    # poll for "ready"
+# Production-grade — guidellm (recommended)
+guidellm benchmark --target https://<name>.<org>.containers.tinfoil.dev \
+    --rate-type concurrent --rate 10 --max-seconds 120 \
+    --data "prompt_tokens=512,output_tokens=128"
 ```
 
-The dashboard shows the SSH command on the container's card:
+## Save results out
+
+The enclave is a ramdisk — anything in `/workspace` is gone on restart. Before redeploying:
 
 ```bash
-ssh -p <port> root@console.tinfoil.sh
+# Push to a GitHub release
+gh release create bench-<run-id> /workspace/results/<run-id>/*
+
+# Or scp from your laptop:
+scp -P <ssh-port> -r root@console.tinfoil.sh:/workspace/results/<run-id> ./
 ```
 
-You land directly in `/workspace` inside the benchbox container, with all bench tools on `$PATH`. `/workspace/CLAUDE.md` describes the in-container workflow.
+## Subsequent releases
 
-### Tearing down
+Edit anything (e.g. bump `ARG VLLM_VERSION` in `Dockerfile`), commit to `main`, then run **Tinfoil Container Build** with a new version. The workflow updates `tinfoil-config.yml`'s digest and tags automatically — same pattern as `confidential-model-router`.
 
-```bash
-tinfoil container delete benchbox
-```
+## File map
 
-## Resource sizing
+- [`Dockerfile`](./Dockerfile) — image contents (`vllm[bench]`, `guidellm`, dev tools)
+- [`tinfoil-config.yml`](./tinfoil-config.yml) — enclave resources (16 CPU / 64 GB / 1 GPU, `cvm-version: 0.8.0`). Bump `gpus` to 8 for multi-GPU bench.
+- [`CLAUDE.md`](./CLAUDE.md) — bench workflow + metrics; baked into the image at `/workspace/CLAUDE.md`
+- [`.github/workflows/`](./.github/workflows) — `tinfoil-build.yml` + `tinfoil-release.yml`
 
-| Field | Value | Reason |
-|-------|-------|--------|
-| `cpus` | 16 | Plenty for client-side load gen; bench is rarely CPU-bound |
-| `memory` | 65536 (64 GB) | Headroom for HF dataset loading and result aggregation |
-| `gpus` | 1 | Required for `vllm bench latency` / `throughput` (in-process). Set to 8 for multi-GPU bench (NVIDIA CC restricts to 1 or 8) |
-
-## Secrets
-
-Set in the dashboard before deploying:
-
-- `GITHUB_TOKEN` — for `gh auth` and private clones
-- `HF_TOKEN` — for Hugging Face dataset and model downloads
-- `TINFOIL_API_KEY` — for hitting other Tinfoil-deployed inference endpoints
-
-## Relationship to model_devbench
-
-`model_devbench` installs dev tools onto a launched `confidential-debug-large` enclave. It still has uses:
-
-- Setting your local `~/.ssh/config` alias for Cursor Remote-SSH
-- Bootstrapping a fresh debug CVM for host-level work (editing `/mnt/ramdisk/config.yml`, restarting `tinfoil-shim`)
-
-For the **benchmarking** path, `model-benchbox` is the lower-friction option: you skip the apt-install loop entirely and get a reproducible, version-pinned environment that boots ready-to-go.
-
-## Limitations
-
-- **No persistent disk.** The enclave is a ramdisk. Save results out (scp, git push, gh release upload) before redeploying.
-- **No attestation.** Debug mode disables it by design. Don't use this for production traffic or sensitive data.
+Debug mode disables attestation by design. Don't use this for production traffic.
