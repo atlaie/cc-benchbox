@@ -6,7 +6,7 @@ gpus: 8
 containers:
   - name: "benchbox"
     # Updated automatically by .github/workflows/tinfoil-build.yml on each release.
-    image: "ghcr.io/tinfoilsh/model-benchbox@sha256:5b2b8f3678c7a5e163cb8f0ac20faf2ff9b5c3d51c6fc723a1dcb2398848b6ac" # v0.0.4
+    image: "ghcr.io/tinfoilsh/model-benchbox@sha256:5941487ca4f64ac9a22b056470845fbfe95903557d8ac8387c23d31147744a7a" # v0.0.5
     runtime: nvidia
     gpus: all
     ipc: host
