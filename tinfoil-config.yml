@@ -9,7 +9,7 @@ memory: 1048576
 containers:
   - name: "phase3-benchbox"
     # Updated automatically by .github/workflows/tinfoil-build.yml on each release.
-    image: "ghcr.io/tinfoilsh/model-benchbox@sha256:5941487ca4f64ac9a22b056470845fbfe95903557d8ac8387c23d31147744a7a" # v0.0.5
+    image: "ghcr.io/atlaie/cc-benchbox@sha256:5941487ca4f64ac9a22b056470845fbfe95903557d8ac8387c23d31147744a7a" # v0.0.5
     ipc: host
     restart: always
     secrets:
