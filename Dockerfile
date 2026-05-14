@@ -28,16 +28,26 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # and the recommended tool for production benchmarking — live progress,
 # exportable reports, richer workload patterns.
 RUN pip install --no-cache-dir \
-        "vllm[bench]" \
-        guidellm \
-        openai \
-        httpx \
-        pandas \
-        datasets
+     "vllm[bench]" \
+     guidellm \
+     openai \
+     httpx \
+     pandas \
+-    datasets
++    datasets \
++    zstandard \
++    boto3
+
+ WORKDIR /workspace
+ COPY CLAUDE.md /workspace/CLAUDE.md
++COPY scripts/ /workspace/scripts/
++COPY data/ /workspace/data/
 
 WORKDIR /workspace
 
 COPY CLAUDE.md /workspace/CLAUDE.md
++COPY scripts/ /workspace/scripts/
++COPY data/ /workspace/data/
 
 # Override the upstream OpenAI-server entrypoint so the container is a
 # long-lived bench shell. SSH in via debug-mode and run benches interactively.

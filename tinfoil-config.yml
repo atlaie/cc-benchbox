@@ -1,21 +1,25 @@
 cvm-version: 0.8.1
 cpus: 128
 memory: 1048576
-gpus: 8
+-gpus: 0
+# Benchbox is a pure HTTP client driving remote targets — no local engine.
+# If Tinfoil rejects gpus: 0 at deploy time, bump to 1 (still leaves all 8
+# H200s available to the target deploys on the reserved node).
 
 containers:
-  - name: "benchbox"
+  - name: "phase3-benchbox"
     # Updated automatically by .github/workflows/tinfoil-build.yml on each release.
     image: "ghcr.io/tinfoilsh/model-benchbox@sha256:5941487ca4f64ac9a22b056470845fbfe95903557d8ac8387c23d31147744a7a" # v0.0.5
-    runtime: nvidia
-    gpus: all
     ipc: host
     restart: always
     secrets:
       - GITHUB_TOKEN
       - HF_TOKEN
       - TINFOIL_API_KEY
-
+      - VLLM_API_KEY
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - R2_ENDPOINT_URL
 # The benchbox is accessed via debug-mode SSH, not over HTTPS. The shim block
 # is required by schema but never exercised — nothing is listening on port
 # 8000 inside the container.
