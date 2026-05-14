@@ -33,21 +33,20 @@ RUN pip install --no-cache-dir \
      openai \
      httpx \
      pandas \
--    datasets
-+    datasets \
-+    zstandard \
-+    boto3
+    datasets \
+    zstandard \
+    boto3
 
  WORKDIR /workspace
  COPY CLAUDE.md /workspace/CLAUDE.md
-+COPY scripts/ /workspace/scripts/
-+COPY data/ /workspace/data/
+ COPY scripts/ /workspace/scripts/
+ COPY data/ /workspace/data/
 
 WORKDIR /workspace
 
 COPY CLAUDE.md /workspace/CLAUDE.md
-+COPY scripts/ /workspace/scripts/
-+COPY data/ /workspace/data/
+COPY scripts/ /workspace/scripts/
+COPY data/ /workspace/data/
 
 # Override the upstream OpenAI-server entrypoint so the container is a
 # long-lived bench shell. SSH in via debug-mode and run benches interactively.
