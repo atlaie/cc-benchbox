@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-REPO="tinfoilsh/model-benchbox"
+REPO="atlaie/cc-benchbox"
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 VERSION=""
