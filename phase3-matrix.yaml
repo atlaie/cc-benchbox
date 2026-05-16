@@ -9,7 +9,7 @@
 
 # --- Tinfoil deployment context ---
 org_subdomain: pour-demain          # Targets resolve as <name>.debug.<org>.containers.tinfoil.dev
-tinfoil_host: control.inf8.tinfoil.sh
+tinfoil_host: control.inf10.tinfoil.sh
 
 # --- Long-lived benchbox ---
 benchbox:
@@ -28,7 +28,7 @@ defaults:
   timeout: 600.0                    # Per-request HTTP timeout (sec)
   health_timeout: 1800.0            # Max wait for target /health → ready (sec). Grad sidecar load ~16 min.
   health_poll_interval: 10.0
-  metrics_interval: 1.0             # /metrics poll cadence (sec); set to 0 to disable
+  metrics_interval: 0             # /metrics poll cadence (sec); set to 0 to disable
   model: glm-5-1-fp8                # vLLM served-model name
   capture_target_logs: true         # `tinfoil container logs <target>` before delete
 
