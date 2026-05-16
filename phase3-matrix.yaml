@@ -38,11 +38,11 @@ defaults:
 # or read from atlaie/cc-deep-eval/tinfoil-config.yml after a fresh build.
 images:
   vllm:
-    repo: atlaie/prepilot-vllm-lens
-    tag: 805a8d822de43edb253766b9325809fc6c9d503a
-    digest: sha256:8bde9593ed53db20b21cdfd0914c3eeeda060c2b32657379bee83971581c2942
+    repo: atlaie/cc-deep-eval
+    tag: v0.0.25
+    digest: sha256:f0f9ed90dba0a4860b4d4ec5d758d20b97d900b7d48d90d470ebd4757ba06f8e
   gradient:
-    repo: atlaie/prepilot-vllm-lens-grad
+    repo: atlaie/cc-deep-eval
     tag: v0.1.16-grad
     digest: sha256:41b1d219b967e73683f78601f0b039e88ba91e77567a25885aab4a1162e00710
 
