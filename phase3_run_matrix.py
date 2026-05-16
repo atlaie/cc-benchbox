@@ -90,7 +90,7 @@ def load_and_validate_matrix(path: Path) -> dict:
             raise ValueError(f"{path}: missing top-level key {key!r}")
 
     bb = data["benchbox"]
-    for k in ("name", "ssh_alias", "scripts_dir", "pairs_json", "out_dir"):
+    for k in ("name", "ssh_alias", "container_name", "scripts_dir", "pairs_json", "out_dir"):
         if k not in bb:
             raise ValueError(f"{path}: benchbox.{k} required")
 
@@ -275,6 +275,7 @@ def build_run_cell_remote_cmd(matrix: dict, cell: dict) -> str:
         # Orchestrator already health-checked from laptop side; benchbox-side
         # poll would only add latency and noise.
         "--skip-health",
+        "--no-upload",          # NEW: container has no egress → can't push to R2 itself
     ]
     if d.get("metrics_interval", 0) > 0:
         parts += [
@@ -283,6 +284,26 @@ def build_run_cell_remote_cmd(matrix: dict, cell: dict) -> str:
         ]
     return " ".join(shlex.quote(p) for p in parts)
 
+def fetch_cell_results(ssh_alias: str, container_name: str, remote_out_dir: str,
+                       cell_id: str, local_cell_dir: Path,
+                       args: argparse.Namespace) -> bool:
+    """Stream results from inside container -> host -> laptop via tar-over-SSH.
+
+    The container has no outbound network, so phase3_run_cell.py's R2 upload
+    is disabled. We pull artifacts to the laptop instead; an optional later
+    pass can upload them to R2 from the laptop (where R2 is reachable)."""
+    local_cell_dir.mkdir(parents=True, exist_ok=True)
+    remote_path = f"{remote_out_dir}/{cell_id}"
+    pipeline = (
+        f"ssh {shlex.quote(ssh_alias)} "
+        f"\"docker exec {shlex.quote(container_name)} "
+        f"tar -C {shlex.quote(remote_path)} -czf - .\" "
+        f"| tar -xzf - -C {shlex.quote(str(local_cell_dir))}"
+    )
+    print(f"  $ {pipeline}")
+    if args.dry_run:
+        return True
+    return subprocess.run(pipeline, shell=True).returncode == 0
 
 def build_vllm_bench_remote_cmd(matrix: dict, cell: dict) -> str:
     """vllm bench serve reference run — C1 cells only. Output in a sibling dir
@@ -307,6 +328,10 @@ def build_vllm_bench_remote_cmd(matrix: dict, cell: dict) -> str:
     bench_str = " ".join(shlex.quote(p) for p in bench)
     return f"mkdir -p {shlex.quote(out)} && {bench_str}"
 
+def _wrap_in_container(remote_cmd: str, container_name: str) -> str:
+    """Wrap a command meant to run *inside* the benchbox container. Required
+    because Tinfoil --debug SSH lands on the CVM host, not in the container."""
+    return f"docker exec {shlex.quote(container_name)} bash -lc {shlex.quote(remote_cmd)}"
 
 def ssh_exec(ssh_alias: str, remote_cmd: str, args: argparse.Namespace,
              timeout: Optional[float] = None) -> int:
@@ -406,10 +431,12 @@ def run_one_cell(matrix: dict, cell: dict, args: argparse.Namespace, out_dir: Pa
     # 3. SSH benchbox → phase3_run_cell.py
     print(f"[3/5] run phase3_run_cell.py via SSH")
     t0 = time.monotonic()
-    remote_cmd = build_run_cell_remote_cmd(matrix, cell)
-    print(f"  remote: {remote_cmd}")
     ssh_alias = matrix["benchbox"]["ssh_alias"]
-    rc = ssh_exec(ssh_alias, remote_cmd, args)
+    container_name = matrix["benchbox"]["container_name"]
+    remote_cmd = build_run_cell_remote_cmd(matrix, cell)
+    wrapped = _wrap_in_container(remote_cmd, container_name)
+    print(f"  container: {remote_cmd}")
+    rc = ssh_exec(ssh_alias, wrapped, args)
     report["stages"]["run_cell"] = {"wall_s": time.monotonic() - t0, "rc": rc}
 
     # 4. Optional: vllm bench reference for C1-off / C1-on
@@ -418,8 +445,9 @@ def run_one_cell(matrix: dict, cell: dict, args: argparse.Namespace, out_dir: Pa
             print(f"[4/5] vllm bench reference (C1 only)")
             t0 = time.monotonic()
             bench_cmd = build_vllm_bench_remote_cmd(matrix, cell)
-            print(f"  remote: {bench_cmd}")
-            bench_rc = ssh_exec(ssh_alias, bench_cmd, args)
+            bench_wrapped = _wrap_in_container(bench_cmd, container_name)
+            print(f"  container: {bench_cmd}")
+            bench_rc = ssh_exec(ssh_alias, bench_wrapped, args)
             report["stages"]["vllm_bench_reference"] = {
                 "wall_s": time.monotonic() - t0, "rc": bench_rc,
             }
@@ -428,7 +456,17 @@ def run_one_cell(matrix: dict, cell: dict, args: argparse.Namespace, out_dir: Pa
             report["stages"]["vllm_bench_reference"] = {"skipped": "run_cell failed"}
     else:
         print(f"[4/5] vllm bench reference: not configured for this cell")
-
+    # 4.5. Fetch cell artifacts off the container (container has no egress)
+    print(f"[4.5/5] fetch cell artifacts to laptop")
+    t0 = time.monotonic()
+    fetched = fetch_cell_results(
+        ssh_alias, container_name,
+        matrix["benchbox"]["out_dir"],
+        cell_id,
+        out_dir / cell_id,
+        args,
+    )
+    report["stages"]["fetch_results"] = {"wall_s": time.monotonic() - t0, "ok": fetched}
     # 5. Logs + delete
     print(f"[5/5] capture target logs + delete")
     t0 = time.monotonic()
@@ -456,10 +494,12 @@ def run_one_cell(matrix: dict, cell: dict, args: argparse.Namespace, out_dir: Pa
 
 def preflight(matrix: dict, args: argparse.Namespace) -> bool:
     """SSH reachability + tinfoil CLI + env vars check."""
-    print("[preflight] checking SSH to benchbox")
+    print("[preflight] checking SSH + docker exec into benchbox container")
     ssh_alias = matrix["benchbox"]["ssh_alias"]
+    container_name = matrix["benchbox"]["container_name"]
+    test_cmd = f"docker exec {shlex.quote(container_name)} python3 --version"
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-           ssh_alias, "echo benchbox_reachable && python3 --version"]
+           ssh_alias, test_cmd]
     if args.dry_run:
         _print_cmd(cmd)
     else:
@@ -467,16 +507,16 @@ def preflight(matrix: dict, args: argparse.Namespace) -> bool:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired:
-            print(f"[preflight] SSH to {ssh_alias} timed out", file=sys.stderr)
+            print(f"[preflight] SSH/docker-exec to {ssh_alias}/{container_name} timed out",
+                  file=sys.stderr)
             return False
         if result.returncode != 0:
-            print(f"[preflight] SSH to {ssh_alias} failed (rc={result.returncode}):",
-                  file=sys.stderr)
+            print(f"[preflight] failed (rc={result.returncode}):", file=sys.stderr)
             print(result.stderr, file=sys.stderr)
-            print(f"  Ensure ~/.ssh/config has a 'Host {ssh_alias}' entry.", file=sys.stderr)
+            print(f"  Check: ssh {ssh_alias} 'docker ps' shows {container_name} running",
+                  file=sys.stderr)
             return False
-        last_line = (result.stdout or "").strip().split("\n")[-1]
-        print(f"  benchbox: {last_line}")
+        print(f"  benchbox python: {result.stdout.strip()}")
 
     print("[preflight] checking tinfoil CLI")
     cmd = ["tinfoil", "--version"]
