@@ -217,15 +217,34 @@ def send_one(
     request_id: int,
     pair_id: int,
     prompt_class: str,
+    enable_thinking: bool = False,             # NEW
+    apply_steering_str: Optional[str] = None,  # NEW
 ) -> RequestRow:
     """One /v1/chat/completions call. extra_body matches
     captures.call_with_capture line-for-line so the response payload
-    layout — including vllm_xargs-injected fields — is identical."""
+    layout — including vllm_xargs-injected fields — is identical.
+
+    Tier 3G / 1C extensions:
+      enable_thinking      sets chat_template_kwargs.enable_thinking
+                           (default False preserves prior behavior).
+      apply_steering_str   pre-built JSON-stringified list of
+                           SteeringVector dicts; injected into
+                           vllm_xargs as `apply_steering_vectors`.
+                           Caller is responsible for json.dumps(...)
+                           per PHASE2_REFERENCE §5.2 / §11.1.
+    """
     t_send = time.time()
     t_perf_start = time.perf_counter()
     http_status = 0
     error: Optional[str] = None
     raw: dict = {}
+
+    # ----- Tier 3G/1C: build vllm_xargs with optional steering ----------
+    # Shallow copy so we never mutate the caller's xargs (the
+    # CONDITION_PRESETS entry is shared across the run).
+    request_xargs = dict(xargs)
+    if apply_steering_str is not None:
+        request_xargs["apply_steering_vectors"] = apply_steering_str
 
     try:
         response = client.chat.completions.create(
@@ -234,15 +253,14 @@ def send_one(
             temperature=0.0,
             max_tokens=max_new_tokens,
             extra_body={
-                "vllm_xargs": xargs,
-                "chat_template_kwargs": {"enable_thinking": False},
+                "vllm_xargs": request_xargs,
+                "chat_template_kwargs": {"enable_thinking": enable_thinking},
             },
         )
         http_status = 200
         raw = response.model_dump()
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
-        # openai client wraps HTTP errors with status_code attr where available
         http_status = getattr(getattr(e, "response", None), "status_code", 0) or 0
 
     t_complete = time.time()
@@ -261,7 +279,7 @@ def send_one(
         pair_id=pair_id,
         prompt_class=prompt_class,
         t_send=t_send,
-        t_first_token=t_complete,    # non-streaming
+        t_first_token=t_complete,
         t_complete=t_complete,
         wall_seconds=wall,
         tokens_in=int(usage.get("prompt_tokens") or 0),
@@ -271,7 +289,6 @@ def send_one(
         http_status=http_status,
         error=error,
     )
-
 
 # ===== prompt loading + ordering ============================================
 # (Identical to phase3_grad_driver — duplicated for now, see header note.)
@@ -307,6 +324,8 @@ def run_cell(
     xargs: dict,
     max_new_tokens: int,
     req_rate: float,
+    enable_thinking: bool = False,             # NEW
+    apply_steering_str: Optional[str] = None,  # NEW
 ) -> list[RequestRow]:
     """Sequential, throttled by send-to-send interval."""
     min_interval = 1.0 / req_rate if req_rate > 0 else 0.0
@@ -320,6 +339,8 @@ def run_cell(
         row = send_one(
             client, model, prompt, xargs, max_new_tokens,
             request_id=i, pair_id=pair_id, prompt_class=prompt_class,
+            enable_thinking=enable_thinking,           # NEW
+            apply_steering_str=apply_steering_str,     # NEW
         )
         rows.append(row)
         if row.error:
@@ -373,6 +394,8 @@ def summarize(
     req_rate: float,
     n_requests_target: int,
     xargs: dict,
+    enable_thinking: bool = False,                # NEW
+    apply_steering_path: Optional[str] = None,    # NEW
 ) -> dict:
     ok = [r for r in rows if r.error is None]
     err = [r for r in rows if r.error is not None]
@@ -390,8 +413,9 @@ def summarize(
         "request_options": {
             "stream": False,
             "temperature": 0.0,
-            "chat_template_kwargs": {"enable_thinking": False},
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},  # was hardcoded False
             "max_retries": 0,
+            "apply_steering_payload": apply_steering_path,                 # NEW
         },
         "req_rate": req_rate,
         "n_requests_target": n_requests_target,
@@ -478,6 +502,41 @@ def parse_args() -> argparse.Namespace:
                         f"({DEFAULT_REQ_RATES}).")
     p.add_argument("--max-new-tokens", type=int, default=32,
                    help="Max completion tokens per request. Matches Phase 2 default.")
+    # ----- Tier 3G / Tier 1C extension flags ----------------------------
+    # Defaults preserve existing behavior — every flag here is optional
+    # and additive. PHASE3_REFERENCE §5.1 unchanged when none are set.
+
+    p.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=False,
+        help=(
+            "Set chat_template_kwargs.enable_thinking=True. Default "
+            "False matches the hardcoded value used by the 18-cell "
+            "primary matrix. Enable for Tier 3G reasoning cells."
+        ),
+    )
+    p.add_argument(
+        "--apply-steering-json",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a JSON file built by make_steering_payload.py. "
+            "Adds `apply_steering_vectors` to vllm_xargs (JSON-"
+            "stringified per PHASE2_REFERENCE §5.2). Required for "
+            "Tier 1C C_H-on-steer."
+        ),
+    )
+    p.add_argument(
+        "--save-responses",
+        action="store_true",
+        default=False,
+        help=(
+            "Write per-request response text + metadata to "
+            "responses.jsonl alongside requests.parquet. Required "
+            "for Tier 1C refusal classifier; harmless otherwise."
+        ),
+    )
     p.add_argument("--timeout", type=float, default=120.0,
                    help="Per-request HTTP timeout (sec). Default 120.")
     p.add_argument("--out-dir", type=Path, required=True,
@@ -499,6 +558,25 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    # ----- Tier 1C: pre-load steering payload if requested --------------
+    apply_steering_str = None  # JSON-stringified list, or None
+    if args.apply_steering_json is not None:
+        payload = json.loads(args.apply_steering_json.read_text())
+        steering_vectors = payload["steering_vectors"]
+        # vllm_xargs is typed Dict[str, Union[str, int, float, List[scalars]]]
+        # → list-of-dicts is rejected at FastAPI boundary; must json.dumps
+        # (PHASE2_REFERENCE §5.2, §11.1). vllm-lens server-side parser
+        # checks isinstance(str) and json.loads back.
+        apply_steering_str = json.dumps(steering_vectors)
+        print(
+            f"[steering] loaded {len(steering_vectors)} vector(s) from "
+            f"{args.apply_steering_json}: layer="
+            f"{steering_vectors[0]['layer_indices']}, scale="
+            f"{steering_vectors[0]['scale']}, "
+            f"norm_match={steering_vectors[0]['norm_match']}",
+            flush=True,
+        )
 
     preset = CONDITION_PRESETS[args.condition]
     xargs = preset_to_xargs(preset)
@@ -549,6 +627,8 @@ def main() -> int:
         xargs=xargs,
         max_new_tokens=args.max_new_tokens,
         req_rate=req_rate,
+        enable_thinking=args.enable_thinking,        # NEW
+        apply_steering_str=apply_steering_str,       # NEW (already loaded above)
     )
     elapsed_min = (time.monotonic() - t0) / 60.0
     print(f"[run] complete in {elapsed_min:.1f} min")
@@ -563,6 +643,8 @@ def main() -> int:
         req_rate=req_rate,
         n_requests_target=args.n_requests,
         xargs=xargs,
+        enable_thinking=args.enable_thinking,                                 # NEW
+        apply_steering_path=str(args.apply_steering_json) if args.apply_steering_json else None,  # NEW
     )
 
     req_path = write_outputs(rows, summary, args.out_dir)

@@ -1,0 +1,159 @@
+# phase3-matrix-concurrency-sweep.yaml
+#
+# Task D — concurrency sweep on the GLM-5.1-FP8 baseline.
+# Extends the brief's existing C1-{off,on}-c8 cell (Table 3b / §3.4) to
+# c ∈ {8, 16, 32, 64}. Tests whether the +31.1% CC delta at c=8 holds
+# at higher continuous-batching load.
+#
+# Grouping (v3): 8 cells → 2 deploys.
+#   group (vllm, off, debug): C1-off-c{8,16,32,64}
+#   group (vllm, on,  debug): C1-on-c{8,16,32,64}
+# Re-running c=8 inside each fresh deploy avoids inter-deploy drift
+# (~5–10% per PHASE2_REFERENCE §setup) confounding the c-trend; the
+# existing brief Table 3b c=8 numbers came from a separate deploy pair.
+#
+# Server-side: vLLM 0.20.0 default max_num_seqs (256 on the wrapped
+# GLM-5.1-FP8 image) covers c≤64 with margin. KV per request at
+# tok_in≤200 + max_tokens=32 ≈ 230 entries; c=64 ⇒ ~15K KV entries,
+# trivial vs MLA capacity. No server config changes required.
+#
+# Expected wall: ~30 min cold load per arm (1 GLM-5.1-FP8 wrap reused
+# across the 4 cells) + ~100s measurement per arm + per-cell warmup.
+# Total: ~1–1.5 h wall on 1-active-node quota.
+
+org_subdomain: pour-demain
+tinfoil_host: control.inf8.tinfoil.sh
+
+benchbox:
+  scripts_dir: .
+  pairs_json: pairs-500.json                    # was: pairs.json
+  pairs_jsonl: pairs.jsonl
+  out_dir: runs/phase3/concurrency_sweep_n500   # was: concurrency_sweep
+
+defaults:
+  n_requests: 500
+  max_new_tokens: 32
+  timeout: 900.0
+  health_timeout: 3600
+  health_poll_interval: 10.0
+  metrics_interval: 0
+  model: glm-5-1-fp8
+  capture_target_logs: true
+  gpu_memory_interval: 5.0
+  ssh_user: tinfoil
+
+images:
+  vllm:
+    repo: atlaie/cc-deep-eval
+    tag: v0.0.25
+    digest: sha256:f0f9ed90dba0a4860b4d4ec5d758d20b97d900b7d48d90d470ebd4757ba06f8e
+    has_v1: true
+    model: glm-5-1-fp8
+
+cells:
+  # NOTE: cc_state values MUST be quoted ("on"/"off"). PyYAML 1.1 parses
+  # bare on/off as booleans. Mirrors phase3-matrix.yaml convention.
+
+  # ============ CC-off arm — group (vllm, off, debug) ============
+
+  - cell_id: C1-off-c8
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    req_rate: 8.0
+    driver: concurrent
+    concurrency: 8
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-off-c16
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    req_rate: 16.0
+    driver: concurrent
+    concurrency: 16
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-off-c32
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    req_rate: 32.0
+    driver: concurrent
+    concurrency: 32
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-off-c64
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    req_rate: 64.0
+    driver: concurrent
+    concurrency: 64
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-off-c128
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    req_rate: 128.0
+    driver: concurrent
+    concurrency: 128
+    n_requests: 500
+    stream: true
+
+  # ============ CC-on arm — group (vllm, on, debug) ============
+
+  - cell_id: C1-on-c8
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    req_rate: 8.0
+    driver: concurrent
+    concurrency: 8
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-on-c16
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    req_rate: 16.0
+    driver: concurrent
+    concurrency: 16
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-on-c32
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    req_rate: 32.0
+    driver: concurrent
+    concurrency: 32
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-on-c64
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    req_rate: 64.0
+    driver: concurrent
+    concurrency: 64
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-on-c128
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    req_rate: 128.0
+    driver: concurrent
+    concurrency: 128
+    n_requests: 500
+    stream: true

@@ -1,7 +1,7 @@
 cvm-version: 0.8.1
 cpus: 128
 memory: 1048576
--gpus: 0
+gpus: 0
 # Benchbox is a pure HTTP client driving remote targets — no local engine.
 # If Tinfoil rejects gpus: 0 at deploy time, bump to 1 (still leaves all 8
 # H200s available to the target deploys on the reserved node).

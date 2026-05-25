@@ -181,6 +181,20 @@ def load_cell(cell_id: str, files: dict[str, Path]) -> dict[str, Any]:
         except Exception as e:
             out["metrics_error"] = f"{type(e).__name__}: {e}"
 
+    # NEW: gpu_memory.parquet (optional, sugg 1)
+    gpu_path = files.get("gpu_memory.parquet")
+    if gpu_path:
+        try:
+            out["gpu_memory"] = pd.read_parquet(gpu_path)
+        except Exception as e:
+            out["gpu_memory_error"] = f"{type(e).__name__}: {e}"
+    elif files.get("gpu_memory.jsonl"):
+        try:
+            jsonl = files["gpu_memory.jsonl"].read_text()
+            rows = [json.loads(line) for line in jsonl.splitlines() if line.strip()]
+            out["gpu_memory"] = pd.DataFrame(rows)
+        except Exception as e:
+            out["gpu_memory_error"] = f"{type(e).__name__}: {e}"
     # vllm-bench reference — directory of JSON file(s) inside cache
     bench_dir = files.get("vllm-bench-reference")
     # Tinfoil's `s3.list_objects_v2` won't list pseudo-directories; we glob
@@ -280,17 +294,150 @@ def summarize_metrics(metrics_df: pd.DataFrame) -> dict[str, Any]:
         "all_metric_names_seen": all_metric_names,
     }
 
+def burst_write_profile(df_ok: "pd.DataFrame") -> dict:
+    """Per-cell I/O footprint. Pure aggregation over existing parquet."""
+    if df_ok is None or df_ok.empty:
+        return {"available": False}
+    if "t_send" not in df_ok.columns or "t_complete" not in df_ok.columns:
+        return {"available": False, "note": "missing time columns"}
+
+    t_send = df_ok["t_send"].astype(float)
+    t_end = df_ok["t_complete"].astype(float)
+    wall_total_s = float(t_end.max() - t_send.min())
+    if wall_total_s <= 0:
+        return {"available": False, "note": "non-positive wall window"}
+
+    bytes_total = float(df_ok["payload_bytes"].sum())
+    per_req_bytes = df_ok["payload_bytes"].astype(float)
+    per_req_wall = df_ok["wall_seconds"].astype(float).clip(lower=1e-6)
+    peak_burst_p95 = float((per_req_bytes / per_req_wall).quantile(0.95))
+
+    return {
+        "available": True,
+        "wall_total_s": wall_total_s,
+        "payload_bytes_total": bytes_total,
+        "payload_mb_total": bytes_total / 1e6,
+        "payload_mbps_sustained": bytes_total / wall_total_s / 1e6,
+        "payload_mb_per_req_p50": float(per_req_bytes.median()) / 1e6,
+        "payload_mb_per_req_p95": float(per_req_bytes.quantile(0.95)) / 1e6,
+        "peak_burst_mbps_p95": peak_burst_p95 / 1e6,
+    }
+
+
+def gpu_memory_summary(gpu_mem_df: "pd.DataFrame") -> dict:
+    """Aggregate GPU/CPU metrics from `tinfoil container metrics -o json`.
+
+    Schema (per data_point row, from CLI):
+      avg_gpu_mem_util, max_gpu_mem_util  — pct of total
+      gpu_mem_total                       — GiB summed across 8 GPUs
+      avg_gpu_util, max_gpu_util          — compute pct
+      avg_cpu_mem_util, max_cpu_mem_util  — pct
+      cpu_mem_total                       — GiB
+      time                                — ISO timestamp
+
+    CLI emits ~one real sample per 60s; intermediate buckets show all zeros.
+    We filter to rows with gpu_mem_total > 0 for peak computation.
+    No per-GPU breakdown — CLI limitation.
+    """
+    if gpu_mem_df is None or gpu_mem_df.empty:
+        return {"available": False}
+    required = {"max_gpu_mem_util", "gpu_mem_total"}
+    if not required.issubset(set(gpu_mem_df.columns)):
+        return {"available": False, "note": "schema mismatch"}
+
+    ok = gpu_mem_df[gpu_mem_df["gpu_mem_total"] > 0]
+    if ok.empty:
+        return {"available": False,
+                "note": f"no non-zero samples in {len(gpu_mem_df)} rows (idle target?)"}
+
+    total_gib = float(ok["gpu_mem_total"].max())
+    peak_pct = float(ok["max_gpu_mem_util"].max())
+    peak_gib = peak_pct * total_gib / 100.0
+    mean_pct = float(ok["avg_gpu_mem_util"].mean())
+
+    return {
+        "available": True,
+        "n_samples": int(len(gpu_mem_df)),
+        "n_nonzero_samples": int(len(ok)),
+        "aggregate_total_gib": total_gib,
+        "peak_pct": peak_pct,
+        "peak_gib": peak_gib,
+        "mean_pct": mean_pct,
+        "gpu_util_peak_pct": float(ok["max_gpu_util"].max())
+            if "max_gpu_util" in ok.columns else None,
+        "gpu_util_mean_pct": float(ok["avg_gpu_util"].mean())
+            if "avg_gpu_util" in ok.columns else None,
+        "note": "aggregate across 8 GPUs; per-GPU detail unavailable from CLI",
+    }
+
+
+def streaming_summary(df_ok: "pd.DataFrame") -> dict:
+    """TTFT/ITL aggregates; safe no-op if columns absent."""
+    if df_ok is None or df_ok.empty or "ttft_seconds" not in df_ok.columns:
+        return {"available": False}
+    ttft = df_ok["ttft_seconds"].dropna()
+    if ttft.empty:
+        return {"available": False, "note": "ttft column present but all NaN"}
+    itl50 = df_ok["itl_p50_seconds"].dropna() if "itl_p50_seconds" in df_ok.columns else None
+    itl95 = df_ok["itl_p95_seconds"].dropna() if "itl_p95_seconds" in df_ok.columns else None
+    n_chunks = df_ok["n_chunks"].dropna() if "n_chunks" in df_ok.columns else None
+    return {
+        "available": True,
+        "n": int(len(ttft)),
+        "ttft_p50_s": float(ttft.quantile(0.50)),
+        "ttft_p95_s": float(ttft.quantile(0.95)),
+        "ttft_max_s": float(ttft.max()),
+        "itl_median_of_per_req_p50_s": float(itl50.median()) if itl50 is not None and not itl50.empty else None,
+        "itl_median_of_per_req_p95_s": float(itl95.median()) if itl95 is not None and not itl95.empty else None,
+        "n_chunks_p50": float(n_chunks.median()) if n_chunks is not None and not n_chunks.empty else None,
+    }
+
+
+def concurrent_comparison(cell_summaries: list[dict]) -> list[dict]:
+    """For each (condition, cc_state) pair, compare concurrent vs sequential cells."""
+    by_key: dict[tuple, dict] = {}
+    for c in cell_summaries:
+        if c.get("missing"):
+            continue
+        key = (c.get("condition"), c.get("cc_state"), int(c.get("concurrency") or 1))
+        by_key[key] = c
+
+    rows: list[dict] = []
+    for (cond, cc, conc), c in by_key.items():
+        if conc <= 1:
+            continue
+        seq = by_key.get((cond, cc, 1))
+        if not seq:
+            continue
+        seq_stream = (seq.get("streaming") or {})
+        c_stream = (c.get("streaming") or {})
+        rows.append({
+            "condition": cond,
+            "cc_state": cc,
+            "concurrency": conc,
+            "seq_wall_p50_s": seq.get("wall_p50_s"),
+            "conc_wall_p50_s": c.get("wall_p50_s"),
+            "seq_throughput_rps": seq.get("request_throughput_req_per_s"),
+            "conc_throughput_rps": c.get("request_throughput_req_per_s"),
+            "seq_ttft_p50_s": seq_stream.get("ttft_p50_s"),
+            "conc_ttft_p50_s": c_stream.get("ttft_p50_s"),
+        })
+    return rows
 
 # ===== per-cell summary ======================================================
 
 def _percentile(series: pd.Series, p: float) -> Optional[float]:
     if series is None or series.empty:
         return None
-    return float(np.percentile(series.dropna(), p))
+    clean = series.dropna()
+    if clean.empty:                              # NEW guard
+        return None
+    return float(np.percentile(clean, p))
 
 
 def cell_summary(cell: dict[str, Any]) -> dict[str, Any]:
-    """One-row-per-cell stats. Tolerates union schema (gradient vs vllm)."""
+    """One-row-per-cell stats. Tolerates union schema (gradient vs vllm,
+    sequential vs streaming vs concurrent)."""
     out: dict[str, Any] = {
         "cell_id": cell["cell_id"],
         "available": "requests" in cell,
@@ -304,6 +451,11 @@ def cell_summary(cell: dict[str, Any]) -> dict[str, Any]:
     out["n_success"] = summary.get("n_success")
     out["success_rate"] = summary.get("success_rate")
 
+    # NEW: driver mode and concurrency (defaults preserve existing-cell behavior)
+    out["driver"] = summary.get("driver", "sequential")
+    out["concurrency"] = int(summary.get("concurrency") or 1)
+    out["streaming"] = {"available": False}  # overwritten below if present
+
     # vllm-bench-aligned derived fields are added by phase3_run_cell.py.
     aligned = summary.get("vllm_bench_aligned") or {}
     out["mean_e2el_ms"] = aligned.get("mean_e2el_ms")
@@ -313,11 +465,16 @@ def cell_summary(cell: dict[str, Any]) -> dict[str, Any]:
     out["output_token_throughput_tok_per_s"] = aligned.get("output_token_throughput_tok_per_s")
 
     if "requests" not in cell:
+        # No request data; still try to surface gpu_memory if it landed.
+        out["burst_write"] = {"available": False}
+        out["gpu_memory"] = gpu_memory_summary(cell.get("gpu_memory"))
         return out
 
     df = cell["requests"]
     ok = df[df["error"].isna() | (df["error"] == "")]
     if ok.empty:
+        out["burst_write"] = {"available": False}
+        out["gpu_memory"] = gpu_memory_summary(cell.get("gpu_memory"))
         return out
 
     out["wall_p50_s"] = _percentile(ok["wall_seconds"], 50)
@@ -345,6 +502,11 @@ def cell_summary(cell: dict[str, Any]) -> dict[str, Any]:
                 "payload_p50_B": _percentile(sub["payload_bytes"], 50),
             }
         out["per_class"] = per_class
+
+    # NEW: burst-write, streaming, gpu memory sub-blocks.
+    out["burst_write"] = burst_write_profile(ok)
+    out["streaming"] = streaming_summary(ok)
+    out["gpu_memory"] = gpu_memory_summary(cell.get("gpu_memory"))
 
     return out
 
@@ -554,11 +716,12 @@ def render_markdown(agg: dict[str, Any]) -> str:
     # --- Per-cell summary table ---
     lines.append("## Per-cell summary")
     lines.append("")
-    lines.append("| Cell | Cond | CC | n_ok/n | wall p50 (s) | wall p95 (s) | payload p50 (B) | throughput (req/s) |")
-    lines.append("|------|------|----|--------|--------------|--------------|-----------------|--------------------|")
+    lines.append("| Cell | Cond | CC | Driver | Conc | n_ok/n | wall p50 (s) | wall p95 (s) | payload p50 (B) | throughput (req/s) |")
+    lines.append("|------|------|----|--------|------|--------|--------------|--------------|-----------------|--------------------|")
     for c in agg["cells"]:
         lines.append(
             f"| `{c['cell_id']}` | {c.get('condition') or '—'} | {c.get('cc_state') or '—'} "
+            f"| {c.get('driver') or 'sequential'} | {c.get('concurrency') or 1} "
             f"| {c.get('n_success') or 0}/{c.get('n_total') or 0} "
             f"| {_fmt(c.get('wall_p50_s'), decimals=3)} "
             f"| {_fmt(c.get('wall_p95_s'), decimals=3)} "
@@ -567,7 +730,7 @@ def render_markdown(agg: dict[str, Any]) -> str:
         )
     lines.append("")
 
-    # --- CC overhead deltas ---
+    # --- CC overhead deltas (unchanged) ---
     lines.append("## CC overhead per condition")
     lines.append("")
     if agg["cc_overhead"]:
@@ -585,7 +748,150 @@ def render_markdown(agg: dict[str, Any]) -> str:
         lines.append("*No CC-on/CC-off pairs available.*")
     lines.append("")
 
-    # --- Phase 2 sanity check ---
+    # --- NEW §3.5: Burst-write I/O profile ---
+    burst_rows = [c for c in agg["cells"] if (c.get("burst_write") or {}).get("available")]
+    if burst_rows:
+        lines.append("## I/O burst-write profile (sugg 3)")
+        lines.append("")
+        lines.append("Sustained and peak payload rates per cell. Sustained = "
+                     "total payload bytes / cell wall window (min-send to max-complete). "
+                     "Peak burst p95 = 95th-pct of per-request `bytes / wall_seconds`. "
+                     "Project upward to size facility burst-buffer tiers.")
+        lines.append("")
+        lines.append("| Cell | Cond | CC | sustained (MB/s) | p50 MB/req | p95 MB/req | peak burst p95 (MB/s) | total payload (MB) |")
+        lines.append("|------|------|----|------------------|------------|------------|-----------------------|--------------------|")
+        for c in burst_rows:
+            bw = c["burst_write"]
+            lines.append(
+                f"| `{c['cell_id']}` | {c.get('condition') or '—'} | {c.get('cc_state') or '—'} "
+                f"| {_fmt(bw.get('payload_mbps_sustained'), decimals=3)} "
+                f"| {_fmt(bw.get('payload_mb_per_req_p50'), decimals=3)} "
+                f"| {_fmt(bw.get('payload_mb_per_req_p95'), decimals=3)} "
+                f"| {_fmt(bw.get('peak_burst_mbps_p95'), decimals=3)} "
+                f"| {_fmt(bw.get('payload_mb_total'), decimals=1)} |"
+            )
+        lines.append("")
+
+    # --- NEW §3.6: GPU memory peaks (sugg 1) ---
+    mem_rows = [c for c in agg["cells"] if (c.get("gpu_memory") or {}).get("available")]
+    if mem_rows:
+        lines.append("## GPU memory under instrumentation (sugg 1)")
+        lines.append("")
+        lines.append("Aggregate across 8 GPUs (per-GPU detail not exposed by "
+                    "`tinfoil container metrics`). Peak GiB = max(`max_gpu_mem_util`) "
+                    "× `gpu_mem_total` / 100 over the cell drive window.")
+        lines.append("")
+        # Build pairs for CC delta
+        by_pair: dict[tuple, dict[str, dict]] = {}
+        for c in mem_rows:
+            key = (c.get("condition"), c.get("driver"), c.get("concurrency"))
+            by_pair.setdefault(key, {})[c.get("cc_state")] = c
+
+        lines.append("| Cell | Cond | CC | peak (GiB) | peak (%) | mean (%) | "
+                    "gpu_util peak (%) | n samples | Δ peak vs CC-off (GiB) |")
+        lines.append("|------|------|----|------------|----------|----------|"
+                    "-------------------|-----------|------------------------|")
+        for c in mem_rows:
+            gm = c["gpu_memory"]
+            key = (c.get("condition"), c.get("driver"), c.get("concurrency"))
+            off_peak = ((by_pair.get(key, {}).get("off") or {}).get("gpu_memory") or {}).get("peak_gib")
+            peak_gib = gm.get("peak_gib")
+            delta_gib = None
+            if c.get("cc_state") == "on" and peak_gib is not None and off_peak is not None:
+                delta_gib = peak_gib - off_peak
+            lines.append(
+                f"| `{c['cell_id']}` | {c.get('condition') or '—'} | {c.get('cc_state') or '—'} "
+                f"| {_fmt(peak_gib, decimals=1)} "
+                f"| {_fmt(gm.get('peak_pct'), decimals=1)} "
+                f"| {_fmt(gm.get('mean_pct'), decimals=1)} "
+                f"| {_fmt(gm.get('gpu_util_peak_pct'), decimals=1)} "
+                f"| {gm.get('n_nonzero_samples', '—')}/{gm.get('n_samples', '—')} "
+                f"| {_fmt(delta_gib, decimals=2)} |"
+            )
+        lines.append("")
+
+    # --- NEW §3.7: TTFT / ITL for streaming cells (sugg 2) ---
+    stream_rows = [c for c in agg["cells"] if (c.get("streaming") or {}).get("available")]
+    if stream_rows:
+        lines.append("## TTFT and inter-token latency (sugg 2)")
+        lines.append("")
+        lines.append("Per-cell streaming statistics. TTFT = wall time from request send "
+                     "to first SSE chunk with non-empty `delta.content`. ITL = inter-chunk "
+                     "gap after the first. Only streaming cells populate these columns.")
+        lines.append("")
+        lines.append("| Cell | Cond | CC | n | TTFT p50 (s) | TTFT p95 (s) | ITL p50 (s) | ITL p95 (s) | chunks p50 |")
+        lines.append("|------|------|----|---|--------------|--------------|-------------|-------------|------------|")
+        for c in stream_rows:
+            s = c["streaming"]
+            lines.append(
+                f"| `{c['cell_id']}` | {c.get('condition') or '—'} | {c.get('cc_state') or '—'} "
+                f"| {s.get('n', 0)} "
+                f"| {_fmt(s.get('ttft_p50_s'), decimals=3)} "
+                f"| {_fmt(s.get('ttft_p95_s'), decimals=3)} "
+                f"| {_fmt(s.get('itl_median_of_per_req_p50_s'), decimals=3)} "
+                f"| {_fmt(s.get('itl_median_of_per_req_p95_s'), decimals=3)} "
+                f"| {_fmt(s.get('n_chunks_p50'), decimals=0)} |"
+            )
+        lines.append("")
+        # Paired CC-on vs CC-off delta on TTFT specifically.
+        by_cond: dict[str, dict[str, dict]] = {}
+        for c in stream_rows:
+            cond = c.get("condition")
+            cc = c.get("cc_state")
+            if cond and cc in ("on", "off"):
+                by_cond.setdefault(cond, {})[cc] = c
+        pair_rows = []
+        for cond, pair in by_cond.items():
+            off = pair.get("off")
+            on = pair.get("on")
+            if not off or not on:
+                continue
+            off_ttft = (off.get("streaming") or {}).get("ttft_p50_s")
+            on_ttft = (on.get("streaming") or {}).get("ttft_p50_s")
+            delta = (on_ttft - off_ttft) if (off_ttft is not None and on_ttft is not None) else None
+            delta_pct = _safe_pct(delta, off_ttft) if delta is not None else None
+            pair_rows.append((cond, off_ttft, on_ttft, delta, delta_pct))
+        if pair_rows:
+            lines.append("### TTFT CC delta")
+            lines.append("")
+            lines.append("| Condition | TTFT p50 CC-off (s) | TTFT p50 CC-on (s) | Δ abs (s) | Δ % |")
+            lines.append("|-----------|---------------------|--------------------|-----------|-----|")
+            for cond, off_ttft, on_ttft, delta, delta_pct in pair_rows:
+                lines.append(
+                    f"| {cond} "
+                    f"| {_fmt(off_ttft, decimals=3)} "
+                    f"| {_fmt(on_ttft, decimals=3)} "
+                    f"| {_fmt(delta, decimals=3)} "
+                    f"| {_fmt(delta_pct, suffix='%', decimals=1)} |"
+                )
+            lines.append("")
+
+    # --- NEW §3.8: Concurrent vs sequential (sugg 5) ---
+    conc_rows = agg.get("concurrent_comparison") or []
+    if conc_rows:
+        lines.append("## Concurrent vs sequential CC delta (sugg 5)")
+        lines.append("")
+        lines.append("Tests whether the sequential CC tax (notably C1's +33.4% in the main matrix) "
+                     "survives realistic continuous-batching load. Concurrent cells use vLLM's "
+                     "continuous batching with a bounded semaphore on the client.")
+        lines.append("")
+        lines.append("| Condition | CC | Conc | Seq wall p50 (s) | Conc wall p50 (s) | "
+                     "Seq thr (r/s) | Conc thr (r/s) | Seq TTFT p50 | Conc TTFT p50 |")
+        lines.append("|-----------|----|------|------------------|-------------------|"
+                     "---------------|----------------|--------------|---------------|")
+        for r in conc_rows:
+            lines.append(
+                f"| {r['condition']} | {r['cc_state']} | {r['concurrency']} "
+                f"| {_fmt(r.get('seq_wall_p50_s'), decimals=3)} "
+                f"| {_fmt(r.get('conc_wall_p50_s'), decimals=3)} "
+                f"| {_fmt(r.get('seq_throughput_rps'), decimals=3)} "
+                f"| {_fmt(r.get('conc_throughput_rps'), decimals=3)} "
+                f"| {_fmt(r.get('seq_ttft_p50_s'), decimals=3)} "
+                f"| {_fmt(r.get('conc_ttft_p50_s'), decimals=3)} |"
+            )
+        lines.append("")
+
+    # --- Phase 2 sanity check (unchanged) ---
     lines.append("## Phase 2 sanity check (CC-off cells)")
     lines.append("")
     lines.append(f"Tolerances per `PHASE3_PLAN §12`: ±{int(PHASE2_WALL_TOLERANCE*100)}% on "
@@ -617,7 +923,7 @@ def render_markdown(agg: dict[str, Any]) -> str:
         lines.append("*No Phase 2 aggregates available for comparison.*")
     lines.append("")
 
-    # --- vllm bench reference ---
+    # --- vllm bench reference (unchanged) ---
     lines.append("## `vllm bench` reference cross-check")
     lines.append("")
     if agg["bench_comparison"]:
@@ -640,7 +946,7 @@ def render_markdown(agg: dict[str, Any]) -> str:
         lines.append("*No vllm-bench reference data captured.*")
     lines.append("")
 
-    # --- /metrics rollup ---
+    # --- /metrics rollup (unchanged) ---
     lines.append("## `/metrics` rollup (where available)")
     lines.append("")
     any_metrics = any(c.get("metrics_summary") for c in agg["cells"])
@@ -685,8 +991,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--matrix", type=Path, required=True,
                    help="Path to phase3-matrix.yaml (defines which cells to expect).")
-    p.add_argument("--cache-dir", type=Path, default=Path("runs/phase3/cache"),
-                   help="Local cache directory for R2-pulled artifacts.")
+    p.add_argument("--cache-dir", type=Path, default=Path("runs/phase3"),
+               help="...")
     p.add_argument("--phase2-dir", type=Path, default=Path("runs/phase2_validation"),
                    help="Directory containing Phase 2 per-condition aggregate.json files.")
     p.add_argument("--out-dir", type=Path, default=Path("runs/phase3"),
@@ -695,6 +1001,7 @@ def parse_args() -> argparse.Namespace:
                    help="Skip R2 entirely; use only what's in --cache-dir.")
     p.add_argument("--refresh", action="store_true",
                    help="Force re-pull from R2 even if cache files exist.")
+    
     return p.parse_args()
 
 
@@ -750,6 +1057,7 @@ def main() -> int:
     cc_rows = cc_overhead_table(cell_summaries)
     p2_rows = phase2_sanity(cell_summaries, args.phase2_dir)
     bench_rows = bench_comparison(cell_summaries, cells_data, args.cache_dir)
+    conc_rows = concurrent_comparison(cell_summaries)
 
     agg = {
         "schema_version": SCHEMA_VERSION,
@@ -759,6 +1067,7 @@ def main() -> int:
         "cc_overhead": cc_rows,
         "phase2_check": p2_rows,
         "bench_comparison": bench_rows,
+        "concurrent_comparison": conc_rows,   # NEW
     }
 
     (args.out_dir / "aggregate.json").write_text(json.dumps(agg, indent=2, default=str))

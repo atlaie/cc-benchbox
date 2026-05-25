@@ -1,48 +1,25 @@
 #!/usr/bin/env python3
 """
-phase3_run_matrix.py — Phase 3 laptop-side matrix orchestrator.
+phase3_run_matrix.py — Phase 3 laptop-side matrix orchestrator (v3-grouped).
 
-Reads phase3-matrix.yaml. For each cell, in declared order:
+v3 change vs v2-local: cells are grouped by (image, cc_state, debug) and
+each group deploys ONCE. All cells in a group run sequentially against the
+shared deploy. Saves model-load time when multiple cells share a deploy
+configuration (typical for the GLM-MoE matrix: 6 vllm cells × 2 CC states
+becomes 2 deploys instead of 12).
 
-    1. tinfoil container create <cell>-target ... [--disable-cc-mode]
-    2. Poll target /health via HTTPS (laptop → target endpoint)
-    3. SSH into the long-lived benchbox: python phase3_run_cell.py ...
-    4. (C1-off / C1-on only) SSH benchbox: vllm bench serve ...
-    5. Capture target logs locally, upload to R2 if credentials present
-    6. tinfoil container delete <cell>-target
+CC-toggle constraint still holds (PHASE2_REFERENCE §9): different CC states
+require different deploys. Within one (image, cc_state, debug), instrumentation
+choice (vllm_xargs payload) and driver choice (sequential / streaming /
+concurrent) are request-level and can vary freely across cells against a
+shared target. The `debug` flag is also deploy-time (per docs.tinfoil.sh):
+debug-mode and production-mode deploys live at different FQDNs and have
+different attestation/SSH semantics, so they cannot share a target.
 
-The benchbox is assumed to already be running (long-lived). Phase3 artifacts
-(requests.parquet, summary.json, metrics.parquet) are written to R2 by
-phase3_run_cell.py running *inside* the benchbox; this orchestrator only
-handles deploy/teardown and target-side log capture from the laptop side.
-
-`matrix_report.json` is written incrementally after each cell, so partial
-runs (or aborted runs) are inspectable.
-
-Usage:
-
-    # Full matrix
-    python phase3_run_matrix.py --matrix phase3-matrix.yaml --out-dir runs/phase3
-
-    # Resume from a specific cell
-    python phase3_run_matrix.py --matrix phase3-matrix.yaml --from-cell C2-off
-
-    # Subset
-    python phase3_run_matrix.py --matrix phase3-matrix.yaml --only-cells C1-off,C1-on
-
-    # Dry run — print every tinfoil/ssh command, execute none
-    python phase3_run_matrix.py --matrix phase3-matrix.yaml --dry-run
-
-Pre-requisites (checked in --preflight unless --skip-preflight):
-  - tinfoil CLI installed and authenticated (TINFOIL_API_KEY env)
-  - SSH alias in ~/.ssh/config matching `benchbox.ssh_alias` from YAML
-  - VLLM_API_KEY env set (or 'EMPTY' default acceptable)
-  - For R2 upload of target logs: S3_BUCKET, R2_ENDPOINT_URL, AWS_*  env vars
-
-Exit codes:
-  0  all cells succeeded
-  1  one or more cells failed
-  2  user error (bad YAML, unknown cell, preflight failure, etc.)
+Driver runs as a local subprocess on the laptop (no SSH/docker exec) because
+Tinfoil CC blocks intra-container network egress, preventing the benchbox
+from reaching target endpoints. CC overhead is measured as a delta (on vs off)
+so laptop→Tinfoil RTT cancels.
 """
 from __future__ import annotations
 
@@ -50,9 +27,11 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -65,44 +44,46 @@ except ImportError:
     print("ERROR: PyYAML required. `pip install pyyaml`", file=sys.stderr)
     sys.exit(2)
 
-try:
-    import boto3  # type: ignore
-except ImportError:
-    boto3 = None
+
+SCHEMA_VERSION = "phase3-run-matrix-v3-grouped"
+VALID_CONDITIONS = {"baseline", "repe_bundle", "routing", "gradient", "steer"}
 
 
-SCHEMA_VERSION = "phase3-run-matrix-v1"
-VALID_CONDITIONS = {"baseline", "repe_bundle", "routing", "gradient"}
-
-
-# ===== YAML load + validate ==================================================
+# ===== YAML load + validate =================================================
 
 def load_and_validate_matrix(path: Path) -> dict:
-    """Parse YAML, validate required structure. Raise ValueError on any issue."""
     if not path.exists():
         raise ValueError(f"matrix file not found: {path}")
     data = yaml.safe_load(path.read_text())
     if not isinstance(data, dict):
         raise ValueError(f"{path}: top-level must be a mapping")
 
-    for key in ("org_subdomain", "tinfoil_host", "benchbox", "defaults", "images", "cells"):
+    for key in ("org_subdomain", "tinfoil_host", "benchbox", "defaults",
+                "images", "cells"):
         if key not in data:
             raise ValueError(f"{path}: missing top-level key {key!r}")
 
     bb = data["benchbox"]
-    for k in ("name", "ssh_alias", "container_name", "scripts_dir", "pairs_json", "out_dir"):
+    for k in ("scripts_dir", "pairs_json", "out_dir"):
         if k not in bb:
-            raise ValueError(f"{path}: benchbox.{k} required")
+            raise ValueError(f"{path}: benchbox.{k} required (laptop-side path)")
 
     for img_name, img in data["images"].items():
         for k in ("repo", "tag", "digest"):
             if k not in img:
                 raise ValueError(f"{path}: images.{img_name}.{k} required")
         if not img["digest"]:
+            raise ValueError(f"{path}: images.{img_name}.digest empty; pin sha256:...")
+        if "has_v1" not in img:
             raise ValueError(
-                f"{path}: images.{img_name}.digest is empty. "
-                f"Pin sha256:... before running. "
-                f"Use `tinfoil container inspect <prior-deploy>` or read tinfoil-config.yml."
+                f"{path}: images.{img_name}.has_v1 required "
+                f"(true for OpenAI-compatible vLLM, false for custom sidecars)"
+            )
+        img.setdefault("model", data["defaults"].get("model"))
+        if not img["model"]:
+            raise ValueError(
+                f"{path}: images.{img_name}.model not set and defaults.model "
+                f"missing — cannot infer served-model name"
             )
 
     seen_ids: set[str] = set()
@@ -114,27 +95,69 @@ def load_and_validate_matrix(path: Path) -> dict:
             raise ValueError(f"{path}: duplicate cell_id {cid!r}")
         seen_ids.add(cid)
         if cell.get("condition") not in VALID_CONDITIONS:
-            raise ValueError(f"{path}: {cid}: invalid condition {cell.get('condition')!r}")
+            raise ValueError(
+                f"{path}: {cid}: invalid condition {cell.get('condition')!r}"
+            )
         cc = cell.get("cc_state")
-        # YAML 1.1 wart: bare `on`/`off` parse to True/False (PyYAML default).
-        # Coerce so unquoted YAML still works; phase3-matrix.yaml header tells
-        # readers to quote anyway, but defense in depth is cheap.
         if cc is True:
             cc = "on"
         elif cc is False:
             cc = "off"
-        cell["cc_state"] = cc  # write back so downstream sees the string
+        cell["cc_state"] = cc
         if cc not in ("on", "off"):
             raise ValueError(f"{path}: {cid}: cc_state must be 'on'|'off', got {cc!r}")
         if cell.get("image") not in data["images"]:
-            raise ValueError(f"{path}: {cid}: image {cell.get('image')!r} not in images map")
+            raise ValueError(
+                f"{path}: {cid}: image {cell.get('image')!r} not in images map"
+            )
         if "req_rate" not in cell:
             raise ValueError(f"{path}: {cid}: req_rate required")
-
+        # NEW (v3): debug field, default from defaults.debug or True.
+        cell.setdefault("debug", data["defaults"].get("debug", True))
+        if not isinstance(cell["debug"], bool):
+            raise ValueError(
+                f"{path}: {cid}: debug must be bool, got "
+                f"{type(cell['debug']).__name__}"
+            )
+        driver = cell.get("driver", "sequential")
+        if driver not in ("sequential", "stream", "concurrent"):
+            raise ValueError(f"{path}: {cid}: invalid driver {driver!r}")
+        cell["driver"] = driver
+        if driver == "concurrent":
+            if ("concurrency" not in cell
+                    or not isinstance(cell["concurrency"], int)
+                    or cell["concurrency"] < 1):
+                raise ValueError(
+                    f"{path}: {cid}: concurrent driver needs int concurrency>=1"
+                )
+        cell["stream"] = bool(cell.get("stream", driver == "stream"))
+        cell.setdefault("n_requests", data["defaults"]["n_requests"])
+        # NEW (v3): per-cell max_new_tokens override; default from defaults block.
+        cell.setdefault("max_new_tokens", data["defaults"]["max_new_tokens"])
+        if not isinstance(cell["max_new_tokens"], int) or cell["max_new_tokens"] < 1:
+            raise ValueError(
+                f"{path}: {cid}: max_new_tokens must be positive int, got "
+                f"{cell['max_new_tokens']!r}"
+            )
+        # NEW: optional per-cell pairs_json override (Task C tok_in sweep).
+        # Falls through to top-level benchbox.pairs_json when absent.
+        # File existence is NOT checked here so a missing/misnamed path
+        # lands a clean per-cell failure in matrix_report.json rather
+        # than aborting the whole run at validation time.
+        if "pairs_json" in cell:
+            if not isinstance(cell["pairs_json"], str):
+                raise ValueError(
+                    f"{path}: {cid}: pairs_json must be string path, got "
+                    f"{type(cell['pairs_json']).__name__}"
+                )
     return data
 
 
 def filter_cells(cells: list[dict], args: argparse.Namespace) -> list[dict]:
+    """Apply --only-cells / --skip-cells / --from-cell. Operates on the flat
+    cell list; grouping happens AFTER filtering, so filters can re-shape group
+    composition (a filter that removes all cells from a group skips that
+    deploy entirely)."""
     out = list(cells)
     if args.only_cells:
         wanted = {c.strip() for c in args.only_cells.split(",") if c.strip()}
@@ -156,25 +179,80 @@ def filter_cells(cells: list[dict], args: argparse.Namespace) -> list[dict]:
     return out
 
 
-# ===== URL construction =====================================================
+# ===== grouping =============================================================
 
-def _target_endpoint(cell_id: str, org_subdomain: str) -> str:
-    """Tinfoil debug-mode endpoint for a target container."""
-    return f"https://{cell_id.lower()}-target.debug.{org_subdomain}.containers.tinfoil.dev"
+@dataclass
+class Group:
+    """A set of cells that share a Tinfoil deploy.
+
+    All cells in a group must agree on (image, cc_state, debug). They may
+    differ freely on: condition, driver, vllm_xargs (instrumentation),
+    max_new_tokens, n_requests, req_rate, steer_direction, etc. — all of those
+    are client-side per-request config, not deploy-time config.
+    """
+    image: str
+    cc_state: str            # "on" | "off"
+    debug: bool
+    cells: list[dict] = field(default_factory=list)
+
+    @property
+    def key(self) -> tuple[str, str, bool]:
+        return (self.image, self.cc_state, self.debug)
+
+    @property
+    def deploy_id(self) -> str:
+        """Tinfoil-safe deploy-name slug. Underscores in image names are
+        replaced with hyphens (Tinfoil container names are lowercase with
+        hyphen separators; underscores are not allowed)."""
+        debug_suffix = "debug" if self.debug else "prod"
+        slug = f"{self.image}-{self.cc_state}-{debug_suffix}"
+        return slug.lower().replace("_", "-")
+
+    @property
+    def target_name(self) -> str:
+        return f"{self.deploy_id}-target"
 
 
-def target_base_url(cell_id: str, org_subdomain: str, has_v1: bool) -> str:
-    """Driver-facing base URL. vLLM cells expect /v1 suffix; gradient cell doesn't."""
-    base = _target_endpoint(cell_id, org_subdomain)
+def group_cells(cells: list[dict]) -> list[Group]:
+    """Group cells by (image, cc_state, debug). Preserves first-appearance
+    order from the input cells list. Each group's cells list also preserves
+    YAML order. Empty groups don't occur — only groups with ≥1 surviving cell
+    are returned.
+    """
+    by_key: dict[tuple, Group] = {}
+    order: list[tuple] = []
+    for cell in cells:
+        key = (cell["image"], cell["cc_state"], cell.get("debug", True))
+        if key not in by_key:
+            by_key[key] = Group(image=key[0], cc_state=key[1], debug=key[2])
+            order.append(key)
+        by_key[key].cells.append(cell)
+    return [by_key[k] for k in order]
+
+
+# ===== URL helpers ==========================================================
+
+def _target_endpoint(target_name: str, org_subdomain: str,
+                      debug: bool = True) -> str:
+    # FQDN per docs.tinfoil.sh/containers/debug-mode (verified 2026-05-20):
+    #   debug=true  → <target>.debug.<org>.containers.tinfoil.dev
+    #   debug=false → <target>.<org>.containers.tinfoil.dev   (production)
+    subdomain = "debug." if debug else ""
+    return f"https://{target_name}.{subdomain}{org_subdomain}.containers.tinfoil.dev"
+
+
+def target_base_url(target_name: str, org_subdomain: str, has_v1: bool,
+                     debug: bool = True) -> str:
+    base = _target_endpoint(target_name, org_subdomain, debug=debug)
     return f"{base}/v1" if has_v1 else base
 
 
-def health_url(cell_id: str, org_subdomain: str) -> str:
-    return f"{_target_endpoint(cell_id, org_subdomain)}/health"
+def health_url(target_name: str, org_subdomain: str, debug: bool = True) -> str:
+    return f"{_target_endpoint(target_name, org_subdomain, debug=debug)}/health"
 
 
-def metrics_url(cell_id: str, org_subdomain: str) -> str:
-    return f"{_target_endpoint(cell_id, org_subdomain)}/metrics"
+def metrics_url(target_name: str, org_subdomain: str, debug: bool = True) -> str:
+    return f"{_target_endpoint(target_name, org_subdomain, debug=debug)}/metrics"
 
 
 # ===== subprocess helpers ===================================================
@@ -188,34 +266,92 @@ def _print_cmd(cmd: list[str]) -> None:
 
 
 def run_cmd(cmd: list[str], dry_run: bool, timeout: Optional[float] = None,
-            capture_output: bool = False) -> subprocess.CompletedProcess:
-    """Run a command, respecting --dry-run."""
+             capture_output: bool = False, env: Optional[dict] = None
+             ) -> subprocess.CompletedProcess:
     _print_cmd(cmd)
     if dry_run:
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-    return subprocess.run(cmd, timeout=timeout, capture_output=capture_output, text=True)
+        return subprocess.CompletedProcess(args=cmd, returncode=0,
+                                            stdout="", stderr="")
+    return subprocess.run(cmd, timeout=timeout, capture_output=capture_output,
+                           text=True, env=env)
 
 
-# ===== Tinfoil + SSH command builders =======================================
+# ===== Tinfoil deploy + status + health (group-level) =======================
 
-def deploy_target(matrix: dict, cell: dict, args: argparse.Namespace) -> bool:
-    img = matrix["images"][cell["image"]]
-    target_name = f"{cell['cell_id'].lower()}-target"
+def deploy_group(matrix: dict, group: Group, args: argparse.Namespace) -> bool:
+    """Deploy the single Tinfoil target backing this group.
+
+    Per docs.tinfoil.sh/containers/cli:
+      - `--ssh-key` is debug-only (we don't pass one; org default SSH keys
+        are baked in at deploy time).
+      - `--debug` is a bare flag, no value.
+      - `--yes` skips the confirmation prompt (exists on `create` but not on
+        `delete`; see PHASE3_REFERENCE §11.2).
+    """
+    img = matrix["images"][group.image]
     cmd = [
-        "tinfoil", "container", "create", target_name,
+        "tinfoil", "container", "create", group.target_name,
         "--repo", img["repo"],
         "--tag", img["tag"],
         "--host", matrix["tinfoil_host"],
-        "--debug",
         "--yes",
     ]
-    if cell["cc_state"] == "off":
+    if group.debug:
+        cmd.append("--debug")
+    if group.cc_state == "off":
         cmd.append("--disable-cc-mode")
     return run_cmd(cmd, dry_run=args.dry_run).returncode == 0
 
 
-def wait_for_target_health(cell: dict, matrix: dict, args: argparse.Namespace) -> bool:
-    url = health_url(cell["cell_id"], matrix["org_subdomain"])
+def wait_for_status_ready(target_name: str, args: argparse.Namespace,
+                            timeout: float = 3600, poll: float = 30) -> bool:
+    """Poll `tinfoil container get` until Status: ready. Gates HTTP health
+    polling so Python doesn't query DNS while still NXDOMAIN — otherwise
+    mDNSResponder caches the negative result for ~30 min
+    (see PHASE3_REFERENCE §11.4).
+    """
+    print(f"  [status] polling tinfoil for status=ready (max {timeout:.0f}s)")
+    if args.dry_run:
+        return True
+    deadline = time.monotonic() + timeout
+    last_status = None
+    while time.monotonic() < deadline:
+        try:
+            r = subprocess.run(
+                ["tinfoil", "container", "get", target_name],
+                capture_output=True, text=True, timeout=30,
+            )
+            status = ""
+            for line in r.stdout.splitlines():
+                if line.strip().startswith("Status:"):
+                    status = line.split(":", 1)[1].strip()
+                    break
+            if status != last_status:
+                print(f"  [status] {status}")
+                last_status = status
+            if status == "ready":
+                # Flush macOS DNS cache so first Python lookup hits fresh.
+                subprocess.run(["sudo", "-n", "killall", "-HUP", "mDNSResponder"],
+                                capture_output=True)
+                subprocess.run(["sudo", "-n", "dscacheutil", "-flushcache"],
+                                capture_output=True)
+                time.sleep(2)
+                return True
+            if status in ("failed", "deleted"):
+                print(f"  [status] aborting — terminal state '{status}'",
+                       file=sys.stderr)
+                return False
+        except Exception as e:
+            print(f"  [status] error: {e}")
+        time.sleep(poll)
+    print(f"  [status] TIMEOUT after {timeout:.0f}s", file=sys.stderr)
+    return False
+
+
+def wait_for_group_health(group: Group, matrix: dict,
+                            args: argparse.Namespace) -> bool:
+    url = health_url(group.target_name, matrix["org_subdomain"],
+                      debug=group.debug)
     timeout = matrix["defaults"]["health_timeout"]
     poll = matrix["defaults"]["health_poll_interval"]
     api_key = os.environ.get("VLLM_API_KEY", "EMPTY")
@@ -226,7 +362,7 @@ def wait_for_target_health(cell: dict, matrix: dict, args: argparse.Namespace) -
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     while time.monotonic() < deadline:
         try:
-            r = httpx.get(url, headers=headers, timeout=30.0)
+            r = httpx.get(url, headers=headers, timeout=30.0, verify=False)
             if r.status_code == 200:
                 try:
                     body = r.json()
@@ -235,7 +371,6 @@ def wait_for_target_health(cell: dict, matrix: dict, args: argparse.Namespace) -
                         return True
                     print(f"  [health] status={body.get('status')!r}; waiting...")
                 except Exception:
-                    # vLLM's /health may return empty body with 200 once ready.
                     print(f"  [health] ready (HTTP 200, empty body)")
                     return True
             else:
@@ -243,249 +378,260 @@ def wait_for_target_health(cell: dict, matrix: dict, args: argparse.Namespace) -
         except Exception as e:
             print(f"  [health] {type(e).__name__}: {e}")
         time.sleep(poll)
-    print(f"  [health] TIMEOUT — /health not ready within {timeout:.0f}s", file=sys.stderr)
+    print(f"  [health] TIMEOUT — /health not ready within {timeout:.0f}s",
+           file=sys.stderr)
     return False
 
 
-def build_run_cell_remote_cmd(matrix: dict, cell: dict) -> str:
-    """Construct the SSH-remote `python phase3_run_cell.py ...` command as a single
-    shell-safe string. Caller passes this as the SSH command argument."""
+def delete_group(group: Group, args: argparse.Namespace) -> bool:
+    cmd = ["tinfoil", "container", "delete", group.target_name]
+    return run_cmd(cmd, dry_run=args.dry_run).returncode == 0
+
+
+# ===== driver invocation builders ===========================================
+
+def build_run_cell_local_cmd(matrix: dict, cell: dict, group: Group) -> list[str]:
+    """Build the phase3_run_cell.py subprocess args. URLs are constructed
+    from the GROUP's deploy (group.target_name), not the cell_id — the cell_id
+    remains the output identifier (cells write to runs/phase3/<cell_id>/)."""
     cell_id = cell["cell_id"]
     img = matrix["images"][cell["image"]]
-    has_v1 = cell["image"] == "vllm"
+    has_v1 = img["has_v1"]
     bb = matrix["benchbox"]
     d = matrix["defaults"]
 
+    venv = os.environ.get("VIRTUAL_ENV")
+    python = (f"{venv}/bin/python"
+               if venv and Path(f"{venv}/bin/python").exists()
+               else sys.executable)
+
     parts = [
-        "python3", f"{bb['scripts_dir']}/phase3_run_cell.py",
+        python, "-u", f"{bb['scripts_dir']}/phase3_run_cell.py",
         "--cell-id", cell_id,
         "--condition", cell["condition"],
         "--cc-state", cell["cc_state"],
-        "--target-base-url", target_base_url(cell_id, matrix["org_subdomain"], has_v1),
-        "--pairs-json", bb["pairs_json"],
+        "--target-base-url", target_base_url(
+            group.target_name, matrix["org_subdomain"], has_v1, debug=group.debug,
+        ),
+        "--pairs-json", cell.get("pairs_json", bb["pairs_json"]),
         "--out-dir", bb["out_dir"],
         "--image-digest", img["digest"],
-        "--n-requests", str(d["n_requests"]),
+        "--n-requests", str(cell.get("n_requests", d["n_requests"])),
         "--req-rate", str(cell["req_rate"]),
-        "--max-new-tokens", str(d["max_new_tokens"]),
+        "--max-new-tokens", str(cell.get("max_new_tokens", d["max_new_tokens"])),
         "--timeout", str(d["timeout"]),
         "--health-timeout", str(d["health_timeout"]),
         "--health-poll-interval", str(d["health_poll_interval"]),
-        "--model", d["model"],
-        # Orchestrator already health-checked from laptop side; benchbox-side
-        # poll would only add latency and noise.
-        "--skip-health",
-        "--no-upload",          # NEW: container has no egress → can't push to R2 itself
+        "--model", img["model"],
+        "--skip-health",     # group-level /health already validated readiness
+        "--no-upload",
+        "--driver", cell.get("driver", "sequential"),
     ]
-    if d.get("metrics_interval", 0) > 0:
-        parts += [
-            "--metrics-url", metrics_url(cell_id, matrix["org_subdomain"]),
-            "--metrics-interval", str(d["metrics_interval"]),
-        ]
-    return " ".join(shlex.quote(p) for p in parts)
+    if cell.get("stream"):
+        parts.append("--stream")
+    if cell.get("driver") == "concurrent":
+        parts += ["--concurrency", str(cell["concurrency"])]
+    # GPU memory capture: pass the group's tinfoil container name so the
+    # cell orchestrator can call `tinfoil container metrics` at cell teardown.
+    parts += ["--tinfoil-target-name", group.target_name]
+    if cell.get("steer_direction"):
+        parts += ["--steer-direction", str(cell["steer_direction"])]
+    # ----- Tier 3G: forward enable_thinking -------------------------
+    if cell.get("enable_thinking", False):
+        parts.append("--enable-thinking")
 
-def fetch_cell_results(ssh_alias: str, container_name: str, remote_out_dir: str,
-                       cell_id: str, local_cell_dir: Path,
-                       args: argparse.Namespace) -> bool:
-    """Stream results from inside container -> host -> laptop via tar-over-SSH.
+    # ----- Tier 1C: forward apply_steering_json ---------------------
+    # Path is passed verbatim (resolved relative to CWD where the
+    # orchestrator is launched, same convention as pairs_json).
+    if cell.get("apply_steering_json"):
+        parts += ["--apply-steering-json", str(cell["apply_steering_json"])]
+    return parts
 
-    The container has no outbound network, so phase3_run_cell.py's R2 upload
-    is disabled. We pull artifacts to the laptop instead; an optional later
-    pass can upload them to R2 from the laptop (where R2 is reachable)."""
-    local_cell_dir.mkdir(parents=True, exist_ok=True)
-    remote_path = f"{remote_out_dir}/{cell_id}"
-    pipeline = (
-        f"ssh {shlex.quote(ssh_alias)} "
-        f"\"docker exec {shlex.quote(container_name)} "
-        f"tar -C {shlex.quote(remote_path)} -czf - .\" "
-        f"| tar -xzf - -C {shlex.quote(str(local_cell_dir))}"
-    )
-    print(f"  $ {pipeline}")
-    if args.dry_run:
-        return True
-    return subprocess.run(pipeline, shell=True).returncode == 0
 
-def build_vllm_bench_remote_cmd(matrix: dict, cell: dict) -> str:
-    """vllm bench serve reference run — C1 cells only. Output in a sibling dir
-    next to phase3_run_cell.py's outputs so phase3_aggregate.py can correlate."""
+def build_vllm_bench_local_cmd(matrix: dict, cell: dict,
+                                 group: Group) -> list[str]:
     cell_id = cell["cell_id"]
     bb = matrix["benchbox"]
     d = matrix["defaults"]
-    out = f"{bb['out_dir']}/{cell_id}/vllm-bench-reference"
-    bench = [
+    out_dir = Path(bb["out_dir"]) / cell_id / "vllm-bench-reference"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return [
         "vllm", "bench", "serve",
         "--backend", "openai-chat",
         "--model", d["model"],
         "--endpoint", "/v1/chat/completions",
-        "--base-url", target_base_url(cell_id, matrix["org_subdomain"], has_v1=False),
+        "--base-url", target_base_url(
+            group.target_name, matrix["org_subdomain"], has_v1=False,
+            debug=group.debug,
+        ),
         "--dataset-name", "custom",
-        "--dataset-path", bb["pairs_jsonl"],
+        "--dataset-path", bb.get("pairs_jsonl", "pairs.jsonl"),
         "--num-prompts", str(d["n_requests"]),
         "--extra-body", '{"chat_template_kwargs":{"enable_thinking":false}}',
         "--save-result",
-        "--result-dir", out,
+        "--result-dir", str(out_dir),
     ]
-    bench_str = " ".join(shlex.quote(p) for p in bench)
-    return f"mkdir -p {shlex.quote(out)} && {bench_str}"
-
-def _wrap_in_container(remote_cmd: str, container_name: str) -> str:
-    """Wrap a command meant to run *inside* the benchbox container. Required
-    because Tinfoil --debug SSH lands on the CVM host, not in the container."""
-    return f"docker exec {shlex.quote(container_name)} bash -lc {shlex.quote(remote_cmd)}"
-
-def ssh_exec(ssh_alias: str, remote_cmd: str, args: argparse.Namespace,
-             timeout: Optional[float] = None) -> int:
-    cmd = ["ssh", ssh_alias, remote_cmd]
-    return run_cmd(cmd, dry_run=args.dry_run, timeout=timeout).returncode
 
 
-def capture_target_logs(cell_id: str, out_dir: Path, args: argparse.Namespace) -> Optional[Path]:
-    target_name = f"{cell_id.lower()}-target"
-    log_path = out_dir / cell_id / "target.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["tinfoil", "container", "logs", target_name]
-    _print_cmd(cmd)
-    print(f"    → {log_path}")
-    if args.dry_run:
-        return None
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        body = result.stdout or ""
-        if result.stderr:
-            body += "\n--- STDERR ---\n" + result.stderr
-        log_path.write_text(body)
-        return log_path
-    except Exception as e:
-        print(f"  [logs] FAILED: {type(e).__name__}: {e}", file=sys.stderr)
-        return None
+# ===== group-level pipeline =================================================
 
+def run_one_group(matrix: dict, group: Group, args: argparse.Namespace,
+                   out_dir: Path) -> dict:
+    """Deploy once → status-ready → /health → loop cells → teardown once.
 
-def upload_local_to_r2(local_path: Optional[Path], cell_id: str) -> bool:
-    if local_path is None or not local_path.exists():
-        return False
-    bucket = os.environ.get("S3_BUCKET")
-    endpoint_url = os.environ.get("R2_ENDPOINT_URL") or os.environ.get("R2_ENDPOINT")
-    if not bucket or boto3 is None:
-        return False
-    kwargs = {"endpoint_url": endpoint_url} if endpoint_url else {}
-    try:
-        s3 = boto3.client("s3", **kwargs)
-        key = f"phase3/{cell_id}/{local_path.name}"
-        s3.upload_file(str(local_path), bucket, key)
-        backend = "r2" if endpoint_url else "s3"
-        print(f"  [upload] {backend}://{bucket}/{key}")
-        return True
-    except Exception as e:
-        print(f"  [upload] FAILED: {type(e).__name__}: {e}", file=sys.stderr)
-        return False
-
-
-def delete_target(cell_id: str, args: argparse.Namespace) -> bool:
-    target_name = f"{cell_id.lower()}-target"
-    cmd = ["tinfoil", "container", "delete", target_name, "--yes"]
-    return run_cmd(cmd, dry_run=args.dry_run).returncode == 0
-
-
-# ===== per-cell pipeline ====================================================
-
-def run_one_cell(matrix: dict, cell: dict, args: argparse.Namespace, out_dir: Path) -> dict:
-    cell_id = cell["cell_id"]
+    Returns a group_report dict with nested per-cell reports. Per-cell failures
+    do NOT abort the group (the deploy stays up and subsequent cells continue).
+    Group-level failures (deploy/status/health) mark all remaining cells as
+    'not-run' and tear down (if reachable).
+    """
     report: dict[str, Any] = {
-        "cell_id": cell_id,
-        "condition": cell["condition"],
-        "cc_state": cell["cc_state"],
-        "image": cell["image"],
-        "req_rate": cell["req_rate"],
+        "deploy_id": group.deploy_id,
+        "target_name": group.target_name,
+        "image": group.image,
+        "cc_state": group.cc_state,
+        "debug": group.debug,
+        "n_cells": len(group.cells),
         "started": now_iso(),
         "stages": {},
+        "cells": [],
     }
 
-    print(f"\n===== {cell_id} (condition={cell['condition']}, cc={cell['cc_state']}) =====")
+    print(f"\n========================================================")
+    print(f"  GROUP {group.deploy_id}  ({len(group.cells)} cell(s))")
+    print(f"     image={group.image}  cc={group.cc_state}  debug={group.debug}")
+    print(f"     cells: {[c['cell_id'] for c in group.cells]}")
+    print(f"========================================================")
 
-    # 1. Deploy target
-    print(f"[1/5] deploy target")
+    def _abort(stage: str, reason: str) -> dict:
+        report["status"] = "fail"
+        report["failed_at"] = stage
+        for c in group.cells:
+            report["cells"].append({
+                "cell_id": c["cell_id"],
+                "condition": c["condition"],
+                "cc_state": c["cc_state"],
+                "regime": c.get("regime", "sequential"),
+                "status": "not-run",
+                "reason": reason,
+            })
+        report["ended"] = now_iso()
+        return report
+
+    # 1. Deploy
+    print(f"\n[group/1] deploy target {group.target_name}")
     t0 = time.monotonic()
-    ok = deploy_target(matrix, cell, args)
+    ok = deploy_group(matrix, group, args)
     report["stages"]["deploy"] = {"wall_s": time.monotonic() - t0, "ok": ok}
     if not ok:
-        report["status"] = "fail"
-        report["failed_at"] = "deploy"
-        report["ended"] = now_iso()
-        return report
+        return _abort("deploy", "deploy_group returned non-zero")
 
-    # 2. Wait for /health
-    print(f"[2/5] wait for target /health")
+    # 2. Status=ready (with non-debug fallback)
+    print(f"\n[group/2] wait for container status=ready")
     t0 = time.monotonic()
-    health_ok = wait_for_target_health(cell, matrix, args)
+    status_ok = wait_for_status_ready(
+        group.target_name, args,
+        timeout=matrix["defaults"]["health_timeout"],
+    )
+    report["stages"]["status_ready"] = {
+        "wall_s": time.monotonic() - t0, "ok": status_ok,
+    }
+    if not status_ok:
+        # Defer to /health regardless of debug flag. /health is the
+        # authoritative liveness signal; Tinfoil's status-reporter has
+        # known lag (non-debug bug per PHASE3_REFERENCE §11.6) and can
+        # also miss the ready transition for slow-loading models in
+        # debug mode. If /health fails too, we abort downstream.
+        print(f"  [status] WARN: {'non-debug' if not group.debug else 'debug'} "
+            f"group timed out at status=ready; deferring to /health "
+            f"as authoritative liveness signal.", file=sys.stderr)
+        report["stages"]["status_ready"]["fallback"] = (
+            f"{'non-debug' if not group.debug else 'debug'}; deferring to /health"
+        )
+
+    # 3. /health
+    print(f"\n[group/3] wait for /health")
+    t0 = time.monotonic()
+    health_ok = wait_for_group_health(group, matrix, args)
     report["stages"]["health"] = {"wall_s": time.monotonic() - t0, "ok": health_ok}
     if not health_ok:
-        # Try to capture logs + delete even on health failure — don't strand the target.
-        log_path = capture_target_logs(cell_id, out_dir, args)
-        upload_local_to_r2(log_path, cell_id)
-        delete_target(cell_id, args)
-        report["status"] = "fail"
-        report["failed_at"] = "health"
-        report["ended"] = now_iso()
-        return report
+        delete_group(group, args)
+        return _abort("health", "/health timeout")
 
-    # 3. SSH benchbox → phase3_run_cell.py
-    print(f"[3/5] run phase3_run_cell.py via SSH")
-    t0 = time.monotonic()
-    ssh_alias = matrix["benchbox"]["ssh_alias"]
-    container_name = matrix["benchbox"]["container_name"]
-    remote_cmd = build_run_cell_remote_cmd(matrix, cell)
-    wrapped = _wrap_in_container(remote_cmd, container_name)
-    print(f"  container: {remote_cmd}")
-    rc = ssh_exec(ssh_alias, wrapped, args)
-    report["stages"]["run_cell"] = {"wall_s": time.monotonic() - t0, "rc": rc}
+    # 4. Loop cells against the live deploy
+    for i, cell in enumerate(group.cells):
+        cell_report: dict[str, Any] = {
+            "cell_id": cell["cell_id"],
+            "condition": cell["condition"],
+            "cc_state": cell["cc_state"],
+            "regime": cell.get("regime", "sequential"),
+            "req_rate": cell.get("req_rate"),
+            "max_new_tokens": cell.get("max_new_tokens"),
+            "started": now_iso(),
+            "stages": {},
+        }
+        print(f"\n  -------- cell {i + 1}/{len(group.cells)}: {cell['cell_id']} "
+              f"(condition={cell['condition']}, "
+              f"driver={cell.get('driver','sequential')}) "
+              f"--------")
 
-    # 4. Optional: vllm bench reference for C1-off / C1-on
-    if cell.get("vllm_bench_reference"):
-        if rc == 0:
-            print(f"[4/5] vllm bench reference (C1 only)")
-            t0 = time.monotonic()
-            bench_cmd = build_vllm_bench_remote_cmd(matrix, cell)
-            bench_wrapped = _wrap_in_container(bench_cmd, container_name)
-            print(f"  container: {bench_cmd}")
-            bench_rc = ssh_exec(ssh_alias, bench_wrapped, args)
-            report["stages"]["vllm_bench_reference"] = {
-                "wall_s": time.monotonic() - t0, "rc": bench_rc,
-            }
-        else:
-            print(f"[4/5] vllm bench reference: skipped (run_cell failed)")
-            report["stages"]["vllm_bench_reference"] = {"skipped": "run_cell failed"}
-    else:
-        print(f"[4/5] vllm bench reference: not configured for this cell")
-    # 4.5. Fetch cell artifacts off the container (container has no egress)
-    print(f"[4.5/5] fetch cell artifacts to laptop")
+        # 4a. Drive
+        t0 = time.monotonic()
+        local_cmd = build_run_cell_local_cmd(matrix, cell, group)
+        _print_cmd(local_cmd)
+        rc = 0
+        if not args.dry_run:
+            rc = subprocess.run(local_cmd, env=os.environ.copy()).returncode
+        cell_report["stages"]["run_cell"] = {
+            "wall_s": time.monotonic() - t0, "rc": rc,
+        }
+        cell_report["status"] = "ok" if rc == 0 else "fail"
+        if rc != 0:
+            cell_report["failed_at"] = "run_cell"
+
+        # 4b. Optional vllm bench reference (per-cell flag in YAML)
+        if cell.get("vllm_bench_reference"):
+            if rc != 0:
+                print(f"  [bench] skipped (run_cell failed)")
+                cell_report["stages"]["vllm_bench_reference"] = {
+                    "skipped": "run_cell failed",
+                }
+            elif shutil.which("vllm") is None:
+                print(f"  [bench] vllm CLI not on PATH; skipping reference run")
+                cell_report["stages"]["vllm_bench_reference"] = {
+                    "skipped": "no local vllm",
+                }
+            else:
+                t0 = time.monotonic()
+                bench_cmd = build_vllm_bench_local_cmd(matrix, cell, group)
+                _print_cmd(bench_cmd)
+                bench_rc = 0
+                if not args.dry_run:
+                    bench_rc = subprocess.run(
+                        bench_cmd, env=os.environ.copy(),
+                    ).returncode
+                cell_report["stages"]["vllm_bench_reference"] = {
+                    "wall_s": time.monotonic() - t0, "rc": bench_rc,
+                }
+
+        cell_report["ended"] = now_iso()
+        report["cells"].append(cell_report)
+
+    # 5. Teardown
+    print(f"\n[group/5] teardown {group.target_name}")
     t0 = time.monotonic()
-    fetched = fetch_cell_results(
-        ssh_alias, container_name,
-        matrix["benchbox"]["out_dir"],
-        cell_id,
-        out_dir / cell_id,
-        args,
-    )
-    report["stages"]["fetch_results"] = {"wall_s": time.monotonic() - t0, "ok": fetched}
-    # 5. Logs + delete
-    print(f"[5/5] capture target logs + delete")
-    t0 = time.monotonic()
-    log_path = None
-    log_uploaded = False
-    if matrix["defaults"].get("capture_target_logs", True):
-        log_path = capture_target_logs(cell_id, out_dir, args)
-        log_uploaded = upload_local_to_r2(log_path, cell_id)
-    delete_ok = delete_target(cell_id, args)
+    delete_ok = delete_group(group, args)
     report["stages"]["teardown"] = {
-        "wall_s": time.monotonic() - t0,
-        "logs_captured": log_path is not None,
-        "logs_uploaded_to_r2": log_uploaded,
-        "delete_ok": delete_ok,
+        "wall_s": time.monotonic() - t0, "delete_ok": delete_ok,
     }
 
-    report["status"] = "ok" if rc == 0 else "fail"
-    if rc != 0:
-        report["failed_at"] = "run_cell"
+    # Roll up status across cells
+    statuses = [c["status"] for c in report["cells"]]
+    if all(s == "ok" for s in statuses):
+        report["status"] = "ok"
+    elif any(s == "ok" for s in statuses):
+        report["status"] = "partial"
+    else:
+        report["status"] = "fail"
     report["ended"] = now_iso()
     return report
 
@@ -493,33 +639,22 @@ def run_one_cell(matrix: dict, cell: dict, args: argparse.Namespace, out_dir: Pa
 # ===== preflight ============================================================
 
 def preflight(matrix: dict, args: argparse.Namespace) -> bool:
-    """SSH reachability + tinfoil CLI + env vars check."""
-    print("[preflight] checking SSH + docker exec into benchbox container")
-    ssh_alias = matrix["benchbox"]["ssh_alias"]
-    container_name = matrix["benchbox"]["container_name"]
-    test_cmd = f"docker exec {shlex.quote(container_name)} python3 --version"
-    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-           ssh_alias, test_cmd]
-    if args.dry_run:
-        _print_cmd(cmd)
-    else:
-        _print_cmd(cmd)
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        except subprocess.TimeoutExpired:
-            print(f"[preflight] SSH/docker-exec to {ssh_alias}/{container_name} timed out",
-                  file=sys.stderr)
+    bb = matrix["benchbox"]
+    print("[preflight] checking local driver scripts + data")
+    required = [
+        Path(bb["scripts_dir"]) / "phase3_run_cell.py",
+        Path(bb["scripts_dir"]) / "phase3_vllm_driver.py",
+        Path(bb["scripts_dir"]) / "phase3_grad_driver.py",
+        Path(bb["pairs_json"]),
+    ]
+    for p in required:
+        if not p.exists():
+            print(f"[preflight] missing: {p}", file=sys.stderr)
             return False
-        if result.returncode != 0:
-            print(f"[preflight] failed (rc={result.returncode}):", file=sys.stderr)
-            print(result.stderr, file=sys.stderr)
-            print(f"  Check: ssh {ssh_alias} 'docker ps' shows {container_name} running",
-                  file=sys.stderr)
-            return False
-        print(f"  benchbox python: {result.stdout.strip()}")
+        print(f"  ok: {p}")
 
-    print("[preflight] checking tinfoil CLI")
-    cmd = ["tinfoil", "--version"]
+    print("[preflight] checking tinfoil CLI + auth")
+    cmd = ["tinfoil", "whoami"]
     if args.dry_run:
         _print_cmd(cmd)
     else:
@@ -527,7 +662,7 @@ def preflight(matrix: dict, args: argparse.Namespace) -> bool:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         except FileNotFoundError:
-            print("[preflight] tinfoil CLI not found on PATH", file=sys.stderr)
+            print("[preflight] tinfoil CLI not on PATH", file=sys.stderr)
             return False
         if result.returncode != 0:
             print("[preflight] tinfoil CLI errored:", file=sys.stderr)
@@ -536,12 +671,12 @@ def preflight(matrix: dict, args: argparse.Namespace) -> bool:
         print(f"  {result.stdout.strip()}")
 
     if not args.dry_run:
-        if not os.environ.get("TINFOIL_API_KEY"):
-            print("[preflight] WARN: TINFOIL_API_KEY not set; CLI may use cached auth")
         if not os.environ.get("VLLM_API_KEY"):
-            print("[preflight] WARN: VLLM_API_KEY not set; falling back to 'EMPTY'")
+            print("[preflight] WARN: VLLM_API_KEY not set; /v1 calls will get 401. "
+                  "Set to your tk_* tenant key.", file=sys.stderr)
         if not os.environ.get("S3_BUCKET"):
-            print("[preflight] WARN: S3_BUCKET not set; target logs won't be uploaded to R2")
+            print("[preflight] WARN: S3_BUCKET not set; per-cell artifacts won't "
+                   "upload to R2")
 
     return True
 
@@ -553,26 +688,38 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--matrix", type=Path, required=True,
-                   help="Path to phase3-matrix.yaml.")
-    p.add_argument("--out-dir", type=Path, default=Path("runs/phase3"),
-                   help="Local directory for matrix_report.json + per-cell target logs.")
-    p.add_argument("--from-cell", default=None,
-                   help="Resume from this cell_id (skips anything declared before it).")
-    p.add_argument("--only-cells", default=None,
-                   help="Comma-separated cell_ids to run; others skipped.")
-    p.add_argument("--skip-cells", default=None,
-                   help="Comma-separated cell_ids to skip.")
-    p.add_argument("--on-fail", choices=["abort", "continue"], default="abort",
-                   help="On cell failure: abort the whole matrix (default), or continue.")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print every tinfoil/ssh command; execute none.")
-    p.add_argument("--skip-preflight", action="store_true",
-                   help="Skip SSH + tinfoil CLI checks. Use only for offline iteration.")
+    p.add_argument("--matrix", type=Path, required=True)
+    p.add_argument("--out-dir", type=Path, default=Path("runs/phase3"))
+    p.add_argument(
+        "--from-cell", default=None,
+        help="Start from this cell_id (skips earlier cells in YAML order). "
+             "Filter is applied BEFORE grouping; the affected cell's group "
+             "will only deploy if surviving cells map to it.",
+    )
+    p.add_argument(
+        "--only-cells", default=None,
+        help="Comma-separated cell_ids to run. Filter applied before grouping.",
+    )
+    p.add_argument(
+        "--skip-cells", default=None,
+        help="Comma-separated cell_ids to skip. Filter applied before grouping.",
+    )
+    p.add_argument(
+        "--on-fail", choices=["abort", "continue"], default="abort",
+        help="abort: stop after the first group with status != ok. "
+             "continue: complete all groups regardless of failures.",
+    )
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--skip-preflight", action="store_true")
     return p.parse_args()
 
 
 def main() -> int:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     args = parse_args()
 
     try:
@@ -591,7 +738,14 @@ def main() -> int:
         print("[error] no cells to run after filtering", file=sys.stderr)
         return 2
 
-    print(f"[matrix] {len(cells)} cell(s): {[c['cell_id'] for c in cells]}")
+    groups = group_cells(cells)
+
+    n_cells = len(cells)
+    print(f"[matrix] {n_cells} cell(s) in {len(groups)} group(s):")
+    for g in groups:
+        cell_summary = ", ".join(c["cell_id"] for c in g.cells)
+        plural = "s" if len(g.cells) > 1 else ""
+        print(f"  - {g.deploy_id} ({len(g.cells)} cell{plural}): {cell_summary}")
     print(f"[matrix] out_dir={args.out_dir}")
     if args.dry_run:
         print(f"[matrix] DRY RUN — no commands executed")
@@ -608,18 +762,19 @@ def main() -> int:
         "matrix_file": str(args.matrix),
         "dry_run": args.dry_run,
         "started": now_iso(),
-        "cells": [],
+        "groups": [],
     }
 
     aborted = False
-    for cell in cells:
-        cell_report = run_one_cell(matrix, cell, args, out_dir)
-        report["cells"].append(cell_report)
-        # Write after every cell so partial runs are inspectable.
+    for group in groups:
+        group_report = run_one_group(matrix, group, args, out_dir)
+        report["groups"].append(group_report)
+        # Persist after each group — partial runs leave durable state.
         (out_dir / "matrix_report.json").write_text(json.dumps(report, indent=2))
-        if cell_report["status"] == "fail" and args.on_fail == "abort":
-            print(f"\n[matrix] ABORT — {cell_report['cell_id']} failed at "
-                  f"{cell_report.get('failed_at', '?')}")
+        if group_report["status"] != "ok" and args.on_fail == "abort":
+            print(f"\n[matrix] ABORT — group {group_report['deploy_id']} "
+                  f"status={group_report['status']} "
+                  f"(failed_at={group_report.get('failed_at', '?')})")
             aborted = True
             break
 
@@ -627,12 +782,19 @@ def main() -> int:
     report["aborted"] = aborted
     (out_dir / "matrix_report.json").write_text(json.dumps(report, indent=2))
 
-    ok = sum(1 for c in report["cells"] if c["status"] == "ok")
-    fail = len(report["cells"]) - ok
-    print(f"\n[matrix] DONE: {ok}/{len(report['cells'])} cells ok, {fail} failed")
+    total_cells = sum(len(g["cells"]) for g in report["groups"])
+    cells_ok = sum(
+        sum(1 for c in gr["cells"] if c.get("status") == "ok")
+        for gr in report["groups"]
+    )
+    cells_fail = total_cells - cells_ok
+    groups_ok = sum(1 for g in report["groups"] if g["status"] == "ok")
+    print(f"\n[matrix] DONE: {cells_ok}/{total_cells} cells ok across "
+          f"{len(report['groups'])} group(s); "
+          f"{groups_ok} group(s) fully ok, {cells_fail} cell failure(s)")
     print(f"[matrix] report: {out_dir / 'matrix_report.json'}")
 
-    return 0 if (ok == len(cells) and not aborted) else 1
+    return 0 if (cells_ok == total_cells and not aborted) else 1
 
 
 if __name__ == "__main__":

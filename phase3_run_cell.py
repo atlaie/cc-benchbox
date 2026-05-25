@@ -48,6 +48,7 @@ import argparse
 import json
 import os
 import sys
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -74,6 +75,8 @@ if str(_HERE) not in sys.path:
 
 import phase3_grad_driver as grad_drv  # noqa: E402
 import phase3_vllm_driver as vllm_drv  # noqa: E402
+import phase3_vllm_driver_stream as stream_drv  # noqa: E402
+import phase3_vllm_driver_concurrent as conc_drv  # noqa: E402
 from openai import OpenAI  # noqa: E402
 
 
@@ -122,6 +125,72 @@ def poll_metrics(
         if stop_event.wait(interval):
             break
 
+def _nearest_metrics_window(elapsed_s: float) -> str:
+    """Smallest supported `tinfoil container metrics --time` window that
+    fully covers `elapsed_s`. The CLI only accepts the fixed set
+    {5m, 15m, 30m, 1h, 24h, today, 7d, 30d, 60d, 90d, 180d, 365d, 3mo,
+    6mo, 12mo, all}; raw `<N>s` values 400."""
+    if elapsed_s <= 300:   return "5m"
+    if elapsed_s <= 900:   return "15m"
+    if elapsed_s <= 1800:  return "30m"
+    if elapsed_s <= 3600:  return "1h"
+    return "24h"
+
+def capture_gpu_memory_window(
+    target_name: str,
+    cell_duration_s: float,
+    out_dir: Path,
+) -> Optional[Path]:
+    """One-shot at cell teardown. Pulls aggregate GPU/CPU metrics for a
+    window covering the drive period plus a 2-minute buffer (since the
+    backend emits samples ~once per 60s).
+
+    Returns path to gpu_memory.parquet, or None on failure. Safe to call
+    even if the CLI is missing — degrades to None and logs.
+    """
+    window_str = _nearest_metrics_window(cell_duration_s + 120)
+    cmd = [
+        "tinfoil", "container", "metrics",
+        "--debug-mode", target_name,
+        "--time", window_str,
+        "-o", "json",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            print(f"[gpu-mem] CLI failed (rc={r.returncode}): "
+                  f"{r.stderr[:300]}", file=sys.stderr)
+            return None
+        data = json.loads(r.stdout)
+        data_points = data.get("data_points", [])
+        if not data_points:
+            print(f"[gpu-mem] no data points returned for window {window_str}")
+            return None
+        if pd is not None:
+            df = pd.DataFrame(data_points)
+            path = out_dir / "gpu_memory.parquet"
+            df.to_parquet(path, index=False)
+        else:
+            path = out_dir / "gpu_memory.json"
+            path.write_text(json.dumps(data, indent=2))
+        n_nonzero = sum(1 for dp in data_points if dp.get("gpu_mem_total", 0) > 0)
+        print(f"[gpu-mem] captured {len(data_points)} samples "
+              f"({n_nonzero} non-zero) over {window_str}; wrote {path}")
+        return path
+    except Exception as e:
+        print(f"[gpu-mem] error: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+
+def write_gpu_memory_artifact(samples: list[dict], out_dir: Path) -> Optional[Path]:
+    if not samples:
+        return None
+    if pd is not None:
+        path = out_dir / "gpu_memory.parquet"
+        pd.DataFrame(samples).to_parquet(path, index=False)
+    else:
+        path = out_dir / "gpu_memory.jsonl"
+        path.write_text("\n".join(json.dumps(s) for s in samples))
+    return path
 
 def write_metrics_artifact(samples: list[dict], out_dir: Path) -> Optional[Path]:
     if not samples:
@@ -142,6 +211,8 @@ def resolve_req_rate(condition: str, override: Optional[float]) -> float:
         return override
     if condition == "gradient":
         return GRADIENT_DEFAULT_REQ_RATE
+    if condition == "steer":
+        return 0.15   # similar weight class to baseline; steer is per-token but lightweight
     return vllm_drv.DEFAULT_REQ_RATES[condition]
 
 
@@ -199,11 +270,23 @@ def run_gradient_cell(args: argparse.Namespace, out_dir: Path) -> tuple[int, dic
 
 def run_vllm_cell(args: argparse.Namespace, out_dir: Path) -> tuple[int, dict]:
     """Returns (exit_code, summary_dict)."""
-    preset = vllm_drv.CONDITION_PRESETS[args.condition]
-    xargs = vllm_drv.preset_to_xargs(preset)
+    # === STEER SPECIAL CASE ===
+    if args.condition == "steer":
+        from phase3_steering import build_steer_xargs, summarize_steer_config
+        if not args.steer_direction or not args.steer_direction.exists():
+            print(f"[error] --steer-direction required and must exist for "
+                  f"steer condition (got: {args.steer_direction})", file=sys.stderr)
+            return 2, {}
+        xargs = build_steer_xargs(args.steer_direction)
+        xargs_log = summarize_steer_config(xargs)
+    else:
+        preset = vllm_drv.CONDITION_PRESETS[args.condition]
+        xargs = vllm_drv.preset_to_xargs(preset)
+        xargs_log = xargs
+
     req_rate = resolve_req_rate(args.condition, args.req_rate)
     print(f"[vllm] base_url={args.target_base_url} condition={args.condition} "
-          f"xargs={xargs} req_rate={req_rate}")
+          f"xargs={xargs_log} req_rate={req_rate}")
 
     if not args.skip_health:
         print(f"[health] polling (max {args.health_timeout:.0f}s)...")
@@ -237,10 +320,26 @@ def run_vllm_cell(args: argparse.Namespace, out_dir: Path) -> tuple[int, dict]:
 
     print(f"[vllm] {len(prompts)} requests @ {req_rate} req/s")
     t0 = time.monotonic()
+    # ----- Tier 1C: pre-load steering payload if requested ---------
+    apply_steering_str = None
+    if args.apply_steering_json is not None:
+        payload = json.loads(args.apply_steering_json.read_text())
+        steering_vectors = payload["steering_vectors"]
+        # vllm_xargs typed Dict[str, Union[str, int, float, List[scalars]]];
+        # list-of-dicts is rejected at FastAPI boundary, must json.dumps.
+        # See PHASE2_REFERENCE §5.2, §11.1.
+        apply_steering_str = json.dumps(steering_vectors)
+        print(f"[steering] loaded from {args.apply_steering_json}: "
+              f"layer={steering_vectors[0]['layer_indices']}, "
+              f"scale={steering_vectors[0]['scale']}, "
+              f"norm_match={steering_vectors[0]['norm_match']}")
+
     rows = vllm_drv.run_cell(
         client, args.model, prompts,
         xargs=xargs, max_new_tokens=args.max_new_tokens,
         req_rate=req_rate,
+        enable_thinking=args.enable_thinking,        # NEW
+        apply_steering_str=apply_steering_str,       # NEW
     )
     elapsed_min = (time.monotonic() - t0) / 60.0
     print(f"[vllm] complete in {elapsed_min:.1f} min")
@@ -255,10 +354,117 @@ def run_vllm_cell(args: argparse.Namespace, out_dir: Path) -> tuple[int, dict]:
         req_rate=req_rate,
         n_requests_target=args.n_requests,
         xargs=xargs,
+        enable_thinking=args.enable_thinking,                                # NEW
+        apply_steering_path=str(args.apply_steering_json) if args.apply_steering_json else None,  # NEW
     )
     vllm_drv.write_outputs(rows, summary, out_dir)
     return (0 if summary["n_success"] > 0 else 3), summary
 
+
+def run_vllm_stream_cell(args: argparse.Namespace, out_dir: Path) -> tuple[int, dict]:
+    # === STEER SPECIAL CASE ===
+    if args.condition == "steer":
+        from phase3_steering import build_steer_xargs, summarize_steer_config
+        if not args.steer_direction or not args.steer_direction.exists():
+            print(f"[error] --steer-direction required and must exist for "
+                  f"steer condition (got: {args.steer_direction})", file=sys.stderr)
+            return 2, {}
+        xargs = build_steer_xargs(args.steer_direction)
+        xargs_log = summarize_steer_config(xargs)
+    else:
+        preset = vllm_drv.CONDITION_PRESETS[args.condition]
+        xargs = vllm_drv.preset_to_xargs(preset)
+        xargs_log = xargs
+
+    req_rate = resolve_req_rate(args.condition, args.req_rate)
+    print(f"[vllm] base_url={args.target_base_url} condition={args.condition} "
+          f"xargs={xargs_log} req_rate={req_rate}")
+
+    if not args.skip_health:
+        print(f"[health] polling (max {args.health_timeout:.0f}s)...")
+        try:
+            stream_drv.wait_for_health(
+                args.target_base_url, args.api_key,
+                timeout=args.health_timeout,
+                poll_interval=args.health_poll_interval,
+            )
+        except TimeoutError as e:
+            print(f"[error] {e}", file=sys.stderr)
+            return 4, {}
+
+    try:
+        pairs = stream_drv.load_pairs(args.pairs_json)
+    except Exception as e:
+        print(f"[error] failed to load --pairs-json: {e}", file=sys.stderr)
+        return 2, {}
+    prompts = stream_drv.interleave(pairs, args.n_requests)
+    if not prompts:
+        return 2, {}
+
+    print(f"[vllm-stream] {len(prompts)} requests @ {req_rate} req/s")
+    t0 = time.monotonic()
+    rows = stream_drv.run_cell(
+        args.target_base_url, args.api_key, args.model, prompts,
+        xargs=xargs, max_new_tokens=args.max_new_tokens,
+        req_rate=req_rate, timeout=args.timeout,
+    )
+    print(f"[vllm-stream] complete in {(time.monotonic()-t0)/60:.1f} min")
+
+    summary = stream_drv.summarize(
+        rows, cell_id=args.cell_id, condition=args.condition, cc_state=args.cc_state,
+        base_url=args.target_base_url, image_digest=args.image_digest,
+        req_rate=req_rate, n_requests_target=args.n_requests, xargs=xargs,
+    )
+    stream_drv.write_outputs(rows, summary, out_dir)
+    return (0 if summary["n_success"] > 0 else 3), summary
+
+
+def run_vllm_concurrent_cell(args: argparse.Namespace, out_dir: Path) -> tuple[int, dict]:
+    preset = conc_drv.CONDITION_PRESETS[args.condition]
+    xargs = conc_drv.preset_to_xargs(preset)
+    req_rate = (args.req_rate if args.req_rate is not None
+                else float(args.concurrency))
+    use_streaming = bool(args.stream)
+    print(f"[vllm-concurrent] base_url={args.target_base_url} c={args.concurrency} "
+          f"stream={use_streaming} req_rate={req_rate}")
+
+    if not args.skip_health:
+        try:
+            conc_drv.wait_for_health(
+                args.target_base_url, args.api_key,
+                timeout=args.health_timeout,
+                poll_interval=args.health_poll_interval,
+            )
+        except TimeoutError as e:
+            print(f"[error] {e}", file=sys.stderr)
+            return 4, {}
+
+    try:
+        pairs = conc_drv.load_pairs(args.pairs_json)
+    except Exception as e:
+        print(f"[error] failed to load --pairs-json: {e}", file=sys.stderr)
+        return 2, {}
+    prompts = conc_drv.interleave(pairs, args.n_requests)
+    if not prompts:
+        return 2, {}
+
+    t0 = time.monotonic()
+    rows = conc_drv.run_cell(
+        args.target_base_url, args.api_key, args.model, prompts,
+        xargs=xargs, max_new_tokens=args.max_new_tokens,
+        req_rate=req_rate, concurrency=args.concurrency,
+        timeout=args.timeout, use_streaming=use_streaming,
+    )
+    print(f"[vllm-concurrent] complete in {(time.monotonic()-t0)/60:.1f} min")
+
+    summary = conc_drv.summarize(
+        rows, cell_id=args.cell_id, condition=args.condition, cc_state=args.cc_state,
+        base_url=args.target_base_url, image_digest=args.image_digest,
+        req_rate=req_rate, concurrency=args.concurrency,
+        n_requests_target=args.n_requests, xargs=xargs, use_streaming=use_streaming,
+    )
+    conc_drv.write_outputs(rows, summary, out_dir)
+    return (0 if summary["n_success"] > 0 else 3), summary
 
 # ===== vllm-bench-aligned derived fields =====================================
 
@@ -373,7 +579,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cell-id", required=True,
                    help="Phase 3 cell identifier (e.g. C1-off, C3-on).")
     p.add_argument("--condition", required=True,
-                   choices=["baseline", "repe_bundle", "routing", "gradient"])
+               choices=["baseline", "repe_bundle", "routing", "gradient", "steer"])
     p.add_argument("--cc-state", required=True, choices=["on", "off"])
 
     # --- target ---
@@ -396,6 +602,26 @@ def parse_args() -> argparse.Namespace:
                         "repe_bundle/routing: 0.2).")
     p.add_argument("--max-new-tokens", type=int, default=32,
                    help="vLLM cells only: completion token cap.")
+    p.add_argument("--steer-direction", type=Path, default=None,
+               help="Path to precomputed RepE direction .npy (required for "
+                    "--condition steer; ignored otherwise).")
+    # ----- Tier 3G / Tier 1C extension flags -----------------------
+    p.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=False,
+        help="Forward to phase3_vllm_driver: enables "
+             "chat_template_kwargs.enable_thinking=True. Tier 3G.",
+    )
+    p.add_argument(
+        "--apply-steering-json",
+        type=Path,
+        default=None,
+        help="Forward to phase3_vllm_driver: path to a JSON file "
+             "built by make_steering_payload.py. Tier 1C "
+             "C_H-on-steer. Independent from --steer-direction "
+             "(the older .npy-based path via phase3_steering).",
+    )
     p.add_argument("--timeout", type=float, default=600.0,
                    help="Per-request HTTP timeout (sec).")
 
@@ -412,6 +638,14 @@ def parse_args() -> argparse.Namespace:
                    help="Seconds between /metrics polls.")
     p.add_argument("--metrics-timeout", type=float, default=5.0,
                    help="Per-poll HTTP timeout (sec).")
+    p.add_argument("--driver", choices=["sequential", "stream", "concurrent"],
+               default="sequential")
+    p.add_argument("--stream", action="store_true",
+                help="Streaming mode (forced on for --driver stream).")
+    p.add_argument("--concurrency", type=int, default=1,
+                help="Concurrent in-flight requests (concurrent driver only).")
+    p.add_argument("--tinfoil-target-name", default=None,
+                help="Tinfoil container name for SSH polling (e.g. c1-off-target).")
 
     # --- output + upload ---
     p.add_argument("--out-dir", type=Path, default=Path("/mnt/ramdisk/phase3"),
@@ -432,6 +666,7 @@ def main() -> int:
     print(f"[cell] {args.cell_id} (condition={args.condition}, cc={args.cc_state})")
     print(f"[cell] out_dir={out_dir}")
     print(f"[cell] target={args.target_base_url}")
+    gpu_capture_t0 = time.monotonic()
 
     # ---- start /metrics poller (optional) ----
     metrics_samples: list[dict] = []
@@ -455,6 +690,10 @@ def main() -> int:
     try:
         if args.condition == "gradient":
             rc, _summary = run_gradient_cell(args, out_dir)
+        elif args.driver == "stream":
+            rc, _summary = run_vllm_stream_cell(args, out_dir)
+        elif args.driver == "concurrent":
+            rc, _summary = run_vllm_concurrent_cell(args, out_dir)
         else:
             rc, _summary = run_vllm_cell(args, out_dir)
     finally:
@@ -468,6 +707,12 @@ def main() -> int:
             print(f"[metrics] captured {len(metrics_samples)} samples "
                   f"({n_ok} HTTP 200); wrote {artifact}")
 
+    if args.tinfoil_target_name:  # name retained; semantically "tinfoil container name"
+        cell_duration_s = time.monotonic() - gpu_capture_t0
+        capture_gpu_memory_window(args.tinfoil_target_name, cell_duration_s, out_dir)
+    if args.tinfoil_target_name:
+        cell_duration_s = time.monotonic() - gpu_capture_t0
+        capture_gpu_memory_window(args.tinfoil_target_name, cell_duration_s, out_dir)
     # ---- post-process summary.json with vllm-bench-aligned fields ----
     summary_path = out_dir / "summary.json"
     if summary_path.exists():
@@ -485,6 +730,7 @@ def main() -> int:
             print(f"[warn] failed to add vllm-bench-aligned fields: "
                   f"{type(e).__name__}: {e}", file=sys.stderr)
 
+    
     # ---- upload all artifacts to R2 ----
     if not args.no_upload:
         upload_cell_to_r2(out_dir, args.cell_id)
