@@ -3,3 +3,17 @@
 .DS_Store
 results/
 runs/
+# Caches / virtualenv / OS noise
+.venv/
+__pycache__/
+.harmbench_cache/
+.DS_Store
+
+# Runtime artifacts (regenerable)
+runs/
+figures/
+*.log
+
+# Editor / backup
+*.bak
+*.patch
