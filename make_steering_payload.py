@@ -177,7 +177,7 @@ def main():
                     action="store_false",
                     help="Apply norm_match=False (absolute scale).")
     ap.add_argument("--out", type=Path,
-                    default=Path("steering_payload.json"),
+                    default=Path("data/steering/steering_payload.json"),
                     help="Output JSON file path.")
     args = ap.parse_args()
 

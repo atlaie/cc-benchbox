@@ -175,7 +175,7 @@ def main():
     ap.add_argument("--split", default="test", choices=list(CSV_BY_SPLIT),
                     help="HarmBench split: test (200), val (41), all (400). "
                          "Default test.")
-    ap.add_argument("--out", type=Path, default=Path("pairs-harmbench.json"),
+    ap.add_argument("--out", type=Path, default=Path("data/pairs-harmbench.json"),
                     help="Output JSON path. Driver's load_pairs() expects "
                          "a single JSON array, NOT JSONL. Default "
                          "pairs-harmbench.json.")

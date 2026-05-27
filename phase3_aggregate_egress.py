@@ -76,8 +76,8 @@ def egress_cell_summary(cell: dict[str, Any]) -> dict[str, Any]:
         return {"available": False}
 
     egress_cols = (
-        "deserialize_seconds", "encoder_total_seconds",
-        "aggregate_seconds", "plot_seconds", "bundle_seconds", "ledger_seconds",
+        "server_deserialize_seconds", "server_encoder_total_seconds",
+        "server_aggregate_seconds", "server_plot_seconds", "server_bundle_seconds", "server_ledger_seconds",
         "aggregate_bytes", "bundle_bytes", "n_plots", "stages_run",
     )
     missing = [c for c in egress_cols if c not in df.columns]
@@ -108,14 +108,14 @@ def egress_cell_summary(cell: dict[str, Any]) -> dict[str, Any]:
         # Stage timings (seconds).
         "wall_p50_s": _p("wall_seconds", 0.50),
         "wall_p95_s": _p("wall_seconds", 0.95),
-        "deserialize_p50_s": _p("deserialize_seconds", 0.50),
-        "deserialize_p95_s": _p("deserialize_seconds", 0.95),
-        "encoder_total_p50_s": _p("encoder_total_seconds", 0.50),
-        "encoder_total_p95_s": _p("encoder_total_seconds", 0.95),
-        "aggregate_p50_s": _p("aggregate_seconds", 0.50),
-        "plot_p50_s": _p("plot_seconds", 0.50),
-        "bundle_p50_s": _p("bundle_seconds", 0.50),
-        "ledger_p50_s": _p("ledger_seconds", 0.50),
+        "deserialize_p50_s": _p("server_deserialize_seconds", 0.50),
+        "deserialize_p95_s": _p("server_deserialize_seconds", 0.95),
+        "encoder_total_p50_s": _p("server_encoder_total_seconds", 0.50),
+        "encoder_total_p95_s": _p("server_encoder_total_seconds", 0.95),
+        "aggregate_p50_s": _p("server_aggregate_seconds", 0.50),
+        "plot_p50_s": _p("server_plot_seconds", 0.50),
+        "bundle_p50_s": _p("server_bundle_seconds", 0.50),
+        "ledger_p50_s": _p("server_ledger_seconds", 0.50),
         # Sizing.
         "payload_p50_B": _p("payload_bytes", 0.50),
         "aggregate_p50_B": _p("aggregate_bytes", 0.50),
@@ -136,18 +136,25 @@ def _safe_pct(num: Optional[float], denom: Optional[float]) -> Optional[float]:
 
 
 def egress_breakdown(cell_summaries: list[dict[str, Any]]) -> dict[str, Any]:
-    """Pair E1/E2/E3 cells against E0 (a baseline cell with the same condition
-    + cc_state that did NOT run through the egress driver — typically C2-on).
+    """Pair E1/E2/E3 cells against an E0 reference (a baseline cell with the
+    same condition + cc_state that did NOT run through the egress driver).
 
     Returns a dict with two keys:
       ``rows``     per-E-cell stage decomposition (one row per E-cell)
       ``deltas``   per-E-cell delta vs E0 (when an E0 reference exists)
 
     Heuristic for pairing:
-      - The "E0" reference is the cell with matching ``condition`` and ``cc_state``
-        that has no egress data (``egress.available == False``) — typically C2-on.
-      - If no such reference exists, deltas[<cell>] = None and only ``rows`` is
-        populated.  Useful when running the E-cell sweep in isolation.
+      - The "E0" reference is a non-egress cell (``egress.available == False``)
+        with matching ``condition`` and ``cc_state``.
+      - When multiple candidates exist, prefer cells whose ``cell_id`` ends in
+        ``-via-egress``. These are run against the SAME deployment as the
+        E-cells, so the delta reflects only the in-TEE encoder pipeline cost.
+        Cross-deployment baselines (e.g. ``C2-on`` from an earlier deploy)
+        confound the delta with host-load drift and should not be used when a
+        same-deployment alternative is present.
+      - If no candidate exists, deltas[<cell>] = {"reference": None} and only
+        ``rows`` is populated. Useful when running the E-cell sweep in
+        isolation.
     """
     # Partition.
     egress_cells: list[dict[str, Any]] = []
@@ -156,13 +163,20 @@ def egress_breakdown(cell_summaries: list[dict[str, Any]]) -> dict[str, Any]:
         eg = cs.get("egress") or {}
         if eg.get("available"):
             egress_cells.append(cs)
-        else:
-            key = (cs.get("condition"), cs.get("cc_state"))
-            # Prefer the first non-egress cell with matching (cond, cc) as the
-            # E0 baseline. C2-on tends to come earlier in the matrix than
-            # E-cells, so this is usually the right reference.
-            if key not in reference_cells_by_key:
-                reference_cells_by_key[key] = cs
+            continue
+
+        key = (cs.get("condition"), cs.get("cc_state"))
+        existing = reference_cells_by_key.get(key)
+        cell_id = cs.get("cell_id") or ""
+        is_via_egress = cell_id.endswith("-via-egress")
+
+        if existing is None:
+            # First candidate wins by default.
+            reference_cells_by_key[key] = cs
+        elif is_via_egress and not (existing.get("cell_id") or "").endswith("-via-egress"):
+            # Same-deployment baseline takes precedence over a cross-deployment one.
+            reference_cells_by_key[key] = cs
+        # Otherwise: keep what we have.
 
     rows: list[dict[str, Any]] = []
     deltas: list[dict[str, Any]] = []
@@ -219,7 +233,6 @@ def egress_breakdown(cell_summaries: list[dict[str, Any]]) -> dict[str, Any]:
         })
 
     return {"rows": rows, "deltas": deltas}
-
 
 # ====================================================================
 # Markdown rendering

@@ -77,6 +77,7 @@ import phase3_grad_driver as grad_drv  # noqa: E402
 import phase3_vllm_driver as vllm_drv  # noqa: E402
 import phase3_vllm_driver_stream as stream_drv  # noqa: E402
 import phase3_vllm_driver_concurrent as conc_drv  # noqa: E402
+import phase3_egress_driver_v2 as egress_drv  # noqa: E402
 from openai import OpenAI  # noqa: E402
 
 
@@ -267,6 +268,56 @@ def run_gradient_cell(args: argparse.Namespace, out_dir: Path) -> tuple[int, dic
     grad_drv.write_outputs(rows, summary, out_dir)
     return (0 if summary["n_success"] > 0 else 3), summary
 
+def run_vllm_egress_cell(args: argparse.Namespace, out_dir: Path) -> tuple[int, dict]:
+    """Egress-pipeline cell. Hits the in-TEE /v1/egress_eval endpoint."""
+    stages = egress_drv._parse_stages(args.egress_stages or "")
+    preset = vllm_drv.CONDITION_PRESETS[args.condition]
+    xargs = vllm_drv.preset_to_xargs(preset)
+    if not xargs:
+        print(f"[error] condition={args.condition} produces no captures", file=sys.stderr)
+        return 2, {}
+    req_rate = (args.req_rate if args.req_rate is not None
+                else vllm_drv.DEFAULT_REQ_RATES[args.condition])
+    session_id = args.session_id or args.cell_id
+
+    if not args.skip_health:
+        try:
+            egress_drv.wait_for_health(
+                args.target_base_url, args.api_key,
+                timeout=args.health_timeout,
+                poll_interval=args.health_poll_interval,
+            )
+        except TimeoutError as e:
+            print(f"[error] {e}", file=sys.stderr); return 4, {}
+
+    try:
+        pairs = vllm_drv.load_pairs(args.pairs_json)
+    except Exception as e:
+        print(f"[error] failed to load --pairs-json: {e}", file=sys.stderr); return 2, {}
+    prompts = vllm_drv.interleave(pairs, args.n_requests)
+    if not prompts:
+        return 2, {}
+
+    print(f"[egress] {len(prompts)} requests @ {req_rate} req/s; stages={sorted(stages) or '∅'}")
+    t0 = time.monotonic()
+    rows = egress_drv.run_cell(
+        base_url=args.target_base_url, api_key=args.api_key, model=args.model,
+        prompts=prompts, xargs=xargs, max_new_tokens=args.max_new_tokens,
+        stages=sorted(stages), session_id=session_id,
+        include_bundle=not args.no_include_bundle,
+        req_rate=req_rate, timeout=args.timeout,
+    )
+    print(f"[egress] complete in {(time.monotonic()-t0)/60:.1f} min")
+
+    summary = egress_drv.summarize(
+        rows=rows, cell_id=args.cell_id, condition=args.condition,
+        cc_state=args.cc_state, base_url=args.target_base_url,
+        image_digest=args.image_digest, req_rate=req_rate,
+        n_requests_target=args.n_requests, xargs=xargs,
+        stages_run=sorted(stages), session_id=session_id,
+    )
+    egress_drv.write_outputs(rows, summary, out_dir)
+    return (0 if summary["n_success"] > 0 else 3), summary
 
 def run_vllm_cell(args: argparse.Namespace, out_dir: Path) -> tuple[int, dict]:
     """Returns (exit_code, summary_dict)."""
@@ -638,8 +689,15 @@ def parse_args() -> argparse.Namespace:
                    help="Seconds between /metrics polls.")
     p.add_argument("--metrics-timeout", type=float, default=5.0,
                    help="Per-poll HTTP timeout (sec).")
-    p.add_argument("--driver", choices=["sequential", "stream", "concurrent"],
-               default="sequential")
+    p.add_argument("--driver",
+                   choices=["sequential", "stream", "concurrent", "egress"],
+                   default="sequential")
+    p.add_argument("--egress-stages", type=str, default=None,
+                   help="Comma-separated subset of {aggregate,plot,bundle,ledger}.")
+    p.add_argument("--session-id", type=str, default=None,
+                   help="Ledger session id; defaults to cell_id.")
+    p.add_argument("--no-include-bundle", action="store_true",
+                   help="Don't ship bundle bytes back over the wire (size measurement only).")
     p.add_argument("--stream", action="store_true",
                 help="Streaming mode (forced on for --driver stream).")
     p.add_argument("--concurrency", type=int, default=1,
@@ -694,6 +752,8 @@ def main() -> int:
             rc, _summary = run_vllm_stream_cell(args, out_dir)
         elif args.driver == "concurrent":
             rc, _summary = run_vllm_concurrent_cell(args, out_dir)
+        elif args.driver == "egress":
+            rc, _summary = run_vllm_egress_cell(args, out_dir)
         else:
             rc, _summary = run_vllm_cell(args, out_dir)
     finally:

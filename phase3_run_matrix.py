@@ -20,6 +20,15 @@ Driver runs as a local subprocess on the laptop (no SSH/docker exec) because
 Tinfoil CC blocks intra-container network egress, preventing the benchbox
 from reaching target endpoints. CC overhead is measured as a delta (on vs off)
 so laptop→Tinfoil RTT cancels.
+
+PATCHED 2026-05-26:
+  - wait_for_group_health now ALSO verifies /v1/models lists the expected
+    served-model. Closes the gap where the Tinfoil edge proxy answers
+    /health 200 (empty body) before vLLM finishes loading the model
+    weights (observed ~25 min lag on GLM-5.1-FP8 / 700 GB).
+  - Compat shims added (deploy_target, wait_for_target_status_ready,
+    wait_for_target_health, delete_target) so phase3_sweep_max_tokens.py
+    (pre-v3, cell-based API) works against this orchestrator.
 """
 from __future__ import annotations
 
@@ -112,7 +121,6 @@ def load_and_validate_matrix(path: Path) -> dict:
             )
         if "req_rate" not in cell:
             raise ValueError(f"{path}: {cid}: req_rate required")
-        # NEW (v3): debug field, default from defaults.debug or True.
         cell.setdefault("debug", data["defaults"].get("debug", True))
         if not isinstance(cell["debug"], bool):
             raise ValueError(
@@ -132,18 +140,12 @@ def load_and_validate_matrix(path: Path) -> dict:
                 )
         cell["stream"] = bool(cell.get("stream", driver == "stream"))
         cell.setdefault("n_requests", data["defaults"]["n_requests"])
-        # NEW (v3): per-cell max_new_tokens override; default from defaults block.
         cell.setdefault("max_new_tokens", data["defaults"]["max_new_tokens"])
         if not isinstance(cell["max_new_tokens"], int) or cell["max_new_tokens"] < 1:
             raise ValueError(
                 f"{path}: {cid}: max_new_tokens must be positive int, got "
                 f"{cell['max_new_tokens']!r}"
             )
-        # NEW: optional per-cell pairs_json override (Task C tok_in sweep).
-        # Falls through to top-level benchbox.pairs_json when absent.
-        # File existence is NOT checked here so a missing/misnamed path
-        # lands a clean per-cell failure in matrix_report.json rather
-        # than aborting the whole run at validation time.
         if "pairs_json" in cell:
             if not isinstance(cell["pairs_json"], str):
                 raise ValueError(
@@ -154,10 +156,6 @@ def load_and_validate_matrix(path: Path) -> dict:
 
 
 def filter_cells(cells: list[dict], args: argparse.Namespace) -> list[dict]:
-    """Apply --only-cells / --skip-cells / --from-cell. Operates on the flat
-    cell list; grouping happens AFTER filtering, so filters can re-shape group
-    composition (a filter that removes all cells from a group skips that
-    deploy entirely)."""
     out = list(cells)
     if args.only_cells:
         wanted = {c.strip() for c in args.only_cells.split(",") if c.strip()}
@@ -183,15 +181,8 @@ def filter_cells(cells: list[dict], args: argparse.Namespace) -> list[dict]:
 
 @dataclass
 class Group:
-    """A set of cells that share a Tinfoil deploy.
-
-    All cells in a group must agree on (image, cc_state, debug). They may
-    differ freely on: condition, driver, vllm_xargs (instrumentation),
-    max_new_tokens, n_requests, req_rate, steer_direction, etc. — all of those
-    are client-side per-request config, not deploy-time config.
-    """
     image: str
-    cc_state: str            # "on" | "off"
+    cc_state: str
     debug: bool
     cells: list[dict] = field(default_factory=list)
 
@@ -201,9 +192,6 @@ class Group:
 
     @property
     def deploy_id(self) -> str:
-        """Tinfoil-safe deploy-name slug. Underscores in image names are
-        replaced with hyphens (Tinfoil container names are lowercase with
-        hyphen separators; underscores are not allowed)."""
         debug_suffix = "debug" if self.debug else "prod"
         slug = f"{self.image}-{self.cc_state}-{debug_suffix}"
         return slug.lower().replace("_", "-")
@@ -214,11 +202,6 @@ class Group:
 
 
 def group_cells(cells: list[dict]) -> list[Group]:
-    """Group cells by (image, cc_state, debug). Preserves first-appearance
-    order from the input cells list. Each group's cells list also preserves
-    YAML order. Empty groups don't occur — only groups with ≥1 surviving cell
-    are returned.
-    """
     by_key: dict[tuple, Group] = {}
     order: list[tuple] = []
     for cell in cells:
@@ -234,9 +217,6 @@ def group_cells(cells: list[dict]) -> list[Group]:
 
 def _target_endpoint(target_name: str, org_subdomain: str,
                       debug: bool = True) -> str:
-    # FQDN per docs.tinfoil.sh/containers/debug-mode (verified 2026-05-20):
-    #   debug=true  → <target>.debug.<org>.containers.tinfoil.dev
-    #   debug=false → <target>.<org>.containers.tinfoil.dev   (production)
     subdomain = "debug." if debug else ""
     return f"https://{target_name}.{subdomain}{org_subdomain}.containers.tinfoil.dev"
 
@@ -279,15 +259,6 @@ def run_cmd(cmd: list[str], dry_run: bool, timeout: Optional[float] = None,
 # ===== Tinfoil deploy + status + health (group-level) =======================
 
 def deploy_group(matrix: dict, group: Group, args: argparse.Namespace) -> bool:
-    """Deploy the single Tinfoil target backing this group.
-
-    Per docs.tinfoil.sh/containers/cli:
-      - `--ssh-key` is debug-only (we don't pass one; org default SSH keys
-        are baked in at deploy time).
-      - `--debug` is a bare flag, no value.
-      - `--yes` skips the confirmation prompt (exists on `create` but not on
-        `delete`; see PHASE3_REFERENCE §11.2).
-    """
     img = matrix["images"][group.image]
     cmd = [
         "tinfoil", "container", "create", group.target_name,
@@ -305,11 +276,6 @@ def deploy_group(matrix: dict, group: Group, args: argparse.Namespace) -> bool:
 
 def wait_for_status_ready(target_name: str, args: argparse.Namespace,
                             timeout: float = 3600, poll: float = 30) -> bool:
-    """Poll `tinfoil container get` until Status: ready. Gates HTTP health
-    polling so Python doesn't query DNS while still NXDOMAIN — otherwise
-    mDNSResponder caches the negative result for ~30 min
-    (see PHASE3_REFERENCE §11.4).
-    """
     print(f"  [status] polling tinfoil for status=ready (max {timeout:.0f}s)")
     if args.dry_run:
         return True
@@ -330,7 +296,6 @@ def wait_for_status_ready(target_name: str, args: argparse.Namespace,
                 print(f"  [status] {status}")
                 last_status = status
             if status == "ready":
-                # Flush macOS DNS cache so first Python lookup hits fresh.
                 subprocess.run(["sudo", "-n", "killall", "-HUP", "mDNSResponder"],
                                 capture_output=True)
                 subprocess.run(["sudo", "-n", "dscacheutil", "-flushcache"],
@@ -348,37 +313,92 @@ def wait_for_status_ready(target_name: str, args: argparse.Namespace,
     return False
 
 
-def wait_for_group_health(group: Group, matrix: dict,
+def wait_for_group_health(group, matrix: dict,
                             args: argparse.Namespace) -> bool:
+    """Wait for the deploy to be ready to serve REAL inference.
+
+    PATCHED (2026-05-26): two-stage readiness check.
+
+      Stage 1 — /health returns HTTP 200. Necessary but NOT sufficient
+      on Tinfoil + vLLM 0.20.0: the edge proxy answers /health with an
+      empty-bodied 200 well before vLLM finishes loading the model
+      (observed ~25 min lag on GLM-5.1-FP8 / 700 GB weights). The
+      original logic treated empty-bodied 200 as ready, causing every
+      cell in that window to fail with APIConnectionError.
+
+      Stage 2 — for OpenAI-compatible images (has_v1=True), additionally
+      verify /v1/models returns HTTP 200 AND lists the expected served-
+      model id. This is the authoritative vLLM-loaded signal — the
+      endpoint only responds once the model is in HBM and the engine
+      is ready to schedule requests. For non-v1 images (custom sidecars
+      like the gradient driver), only /health is checked.
+
+    `group` is duck-typed: needs .target_name, .image, .cc_state, .debug.
+    Both the dataclass Group (new orchestrator) and the _SweepGroup shim
+    used by phase3_sweep_max_tokens.py satisfy this.
+    """
     url = health_url(group.target_name, matrix["org_subdomain"],
                       debug=group.debug)
+    img = matrix["images"][group.image]
+    expected_model = img["model"]
+    v1_models_url: Optional[str] = None
+    if img.get("has_v1"):
+        v1_base = target_base_url(group.target_name, matrix["org_subdomain"],
+                                    has_v1=True, debug=group.debug)
+        v1_models_url = f"{v1_base}/models"
+
     timeout = matrix["defaults"]["health_timeout"]
     poll = matrix["defaults"]["health_poll_interval"]
     api_key = os.environ.get("VLLM_API_KEY", "EMPTY")
     print(f"  [health] polling {url} (max {timeout:.0f}s, every {poll:.0f}s)")
+    if v1_models_url:
+        print(f"  [health] AND verifying /v1/models lists model="
+              f"{expected_model!r}")
     if args.dry_run:
         return True
     deadline = time.monotonic() + timeout
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
     while time.monotonic() < deadline:
+        # Stage 1 — /health
+        health_passed = False
         try:
             r = httpx.get(url, headers=headers, timeout=30.0, verify=False)
             if r.status_code == 200:
-                try:
-                    body = r.json()
-                    if body.get("status") == "ok":
-                        print(f"  [health] ready: {body}")
-                        return True
-                    print(f"  [health] status={body.get('status')!r}; waiting...")
-                except Exception:
-                    print(f"  [health] ready (HTTP 200, empty body)")
-                    return True
+                health_passed = True
             else:
-                print(f"  [health] HTTP {r.status_code}; waiting...")
+                print(f"  [health] /health HTTP {r.status_code}; waiting...")
         except Exception as e:
-            print(f"  [health] {type(e).__name__}: {e}")
+            print(f"  [health] /health {type(e).__name__}: {e}; waiting...")
+
+        # Stage 2 — /v1/models (only for has_v1=True images)
+        if health_passed:
+            if not v1_models_url:
+                print(f"  [health] ready (HTTP 200; non-v1 image, no /v1 check)")
+                return True
+            try:
+                mr = httpx.get(v1_models_url, headers=headers,
+                                timeout=30.0, verify=False)
+                if mr.status_code == 200:
+                    try:
+                        body = mr.json()
+                        models = [m.get("id") for m in body.get("data", [])]
+                    except Exception:
+                        models = []
+                    if expected_model in models:
+                        print(f"  [health] ready: /health=200 AND "
+                              f"/v1/models lists {expected_model!r}")
+                        return True
+                    print(f"  [health] /v1/models=200 but {expected_model!r} "
+                          f"not in {models}; vLLM still warming...")
+                else:
+                    print(f"  [health] /health=200 but /v1/models HTTP "
+                          f"{mr.status_code}; vLLM still loading model...")
+            except Exception as e:
+                print(f"  [health] /health=200 but /v1/models "
+                      f"{type(e).__name__}: {e}; vLLM still loading model...")
         time.sleep(poll)
-    print(f"  [health] TIMEOUT — /health not ready within {timeout:.0f}s",
+    print(f"  [health] TIMEOUT — endpoint not ready within {timeout:.0f}s",
            file=sys.stderr)
     return False
 
@@ -388,12 +408,65 @@ def delete_group(group: Group, args: argparse.Namespace) -> bool:
     return run_cmd(cmd, dry_run=args.dry_run).returncode == 0
 
 
+# ===== compat shims for phase3_sweep_max_tokens.py ==========================
+# The sweep script was written against the pre-v3 (cell-based) API and calls
+# orch.deploy_target / wait_for_target_status_ready / wait_for_target_health /
+# delete_target. These shims wrap the new Group-based API so the sweep works
+# without modification, while preserving the sweep's own naming convention
+# (target_name = "{cell_id.lower()}-target", e.g. "c1-off-sweep-target").
+
+def deploy_target(matrix: dict, cell: dict, args: argparse.Namespace) -> bool:
+    """Compat shim: deploys a Tinfoil container using cell['cell_id'] as the
+    target name basis (matching phase3_sweep_max_tokens.py's expectations).
+    """
+    img = matrix["images"][cell["image"]]
+    target_name = f"{cell['cell_id'].lower()}-target"
+    cmd = ["tinfoil", "container", "create", target_name,
+           "--repo", img["repo"], "--tag", img["tag"],
+           "--host", matrix["tinfoil_host"], "--yes"]
+    debug = cell.get("debug", matrix["defaults"].get("debug", True))
+    if debug:
+        cmd.append("--debug")
+    if cell["cc_state"] == "off":
+        cmd.append("--disable-cc-mode")
+    return run_cmd(cmd, dry_run=args.dry_run).returncode == 0
+
+
+def wait_for_target_status_ready(deploy_cell_id: str,
+                                   args: argparse.Namespace,
+                                   timeout: float = 3600) -> bool:
+    """Compat shim. deploy_cell_id is what the sweep calls its cell-id
+    (e.g. "c1-off-sweep"); the real Tinfoil target_name has "-target" appended.
+    """
+    target_name = f"{deploy_cell_id.lower()}-target"
+    return wait_for_status_ready(target_name, args, timeout=timeout)
+
+
+def wait_for_target_health(cell: dict, matrix: dict,
+                             args: argparse.Namespace) -> bool:
+    """Compat shim. Builds a synthetic group-shaped object whose target_name
+    follows the sweep's naming, then delegates to the PATCHED
+    wait_for_group_health (with /v1/models verification)."""
+    class _SweepGroup:
+        pass
+    sg = _SweepGroup()
+    sg.image = cell["image"]
+    sg.cc_state = cell["cc_state"]
+    sg.debug = cell.get("debug", matrix["defaults"].get("debug", True))
+    sg.target_name = f"{cell['cell_id'].lower()}-target"
+    return wait_for_group_health(sg, matrix, args)
+
+
+def delete_target(deploy_cell_id: str, args: argparse.Namespace) -> bool:
+    """Compat shim. Uses the sweep's deploy naming."""
+    target_name = f"{deploy_cell_id.lower()}-target"
+    cmd = ["tinfoil", "container", "delete", target_name]
+    return run_cmd(cmd, dry_run=args.dry_run).returncode == 0
+
+
 # ===== driver invocation builders ===========================================
 
 def build_run_cell_local_cmd(matrix: dict, cell: dict, group: Group) -> list[str]:
-    """Build the phase3_run_cell.py subprocess args. URLs are constructed
-    from the GROUP's deploy (group.target_name), not the cell_id — the cell_id
-    remains the output identifier (cells write to runs/phase3/<cell_id>/)."""
     cell_id = cell["cell_id"]
     img = matrix["images"][cell["image"]]
     has_v1 = img["has_v1"]
@@ -423,7 +496,7 @@ def build_run_cell_local_cmd(matrix: dict, cell: dict, group: Group) -> list[str
         "--health-timeout", str(d["health_timeout"]),
         "--health-poll-interval", str(d["health_poll_interval"]),
         "--model", img["model"],
-        "--skip-health",     # group-level /health already validated readiness
+        "--skip-health",
         "--no-upload",
         "--driver", cell.get("driver", "sequential"),
     ]
@@ -431,18 +504,11 @@ def build_run_cell_local_cmd(matrix: dict, cell: dict, group: Group) -> list[str
         parts.append("--stream")
     if cell.get("driver") == "concurrent":
         parts += ["--concurrency", str(cell["concurrency"])]
-    # GPU memory capture: pass the group's tinfoil container name so the
-    # cell orchestrator can call `tinfoil container metrics` at cell teardown.
     parts += ["--tinfoil-target-name", group.target_name]
     if cell.get("steer_direction"):
         parts += ["--steer-direction", str(cell["steer_direction"])]
-    # ----- Tier 3G: forward enable_thinking -------------------------
     if cell.get("enable_thinking", False):
         parts.append("--enable-thinking")
-
-    # ----- Tier 1C: forward apply_steering_json ---------------------
-    # Path is passed verbatim (resolved relative to CWD where the
-    # orchestrator is launched, same convention as pairs_json).
     if cell.get("apply_steering_json"):
         parts += ["--apply-steering-json", str(cell["apply_steering_json"])]
     return parts
@@ -465,7 +531,7 @@ def build_vllm_bench_local_cmd(matrix: dict, cell: dict,
             debug=group.debug,
         ),
         "--dataset-name", "custom",
-        "--dataset-path", bb.get("pairs_jsonl", "pairs.jsonl"),
+        "--dataset-path", bb.get("pairs_jsonl", "data/pairs.jsonl"),
         "--num-prompts", str(d["n_requests"]),
         "--extra-body", '{"chat_template_kwargs":{"enable_thinking":false}}',
         "--save-result",
@@ -477,13 +543,6 @@ def build_vllm_bench_local_cmd(matrix: dict, cell: dict,
 
 def run_one_group(matrix: dict, group: Group, args: argparse.Namespace,
                    out_dir: Path) -> dict:
-    """Deploy once → status-ready → /health → loop cells → teardown once.
-
-    Returns a group_report dict with nested per-cell reports. Per-cell failures
-    do NOT abort the group (the deploy stays up and subsequent cells continue).
-    Group-level failures (deploy/status/health) mark all remaining cells as
-    'not-run' and tear down (if reachable).
-    """
     report: dict[str, Any] = {
         "deploy_id": group.deploy_id,
         "target_name": group.target_name,
@@ -517,7 +576,6 @@ def run_one_group(matrix: dict, group: Group, args: argparse.Namespace,
         report["ended"] = now_iso()
         return report
 
-    # 1. Deploy
     print(f"\n[group/1] deploy target {group.target_name}")
     t0 = time.monotonic()
     ok = deploy_group(matrix, group, args)
@@ -525,7 +583,6 @@ def run_one_group(matrix: dict, group: Group, args: argparse.Namespace,
     if not ok:
         return _abort("deploy", "deploy_group returned non-zero")
 
-    # 2. Status=ready (with non-debug fallback)
     print(f"\n[group/2] wait for container status=ready")
     t0 = time.monotonic()
     status_ok = wait_for_status_ready(
@@ -536,11 +593,6 @@ def run_one_group(matrix: dict, group: Group, args: argparse.Namespace,
         "wall_s": time.monotonic() - t0, "ok": status_ok,
     }
     if not status_ok:
-        # Defer to /health regardless of debug flag. /health is the
-        # authoritative liveness signal; Tinfoil's status-reporter has
-        # known lag (non-debug bug per PHASE3_REFERENCE §11.6) and can
-        # also miss the ready transition for slow-loading models in
-        # debug mode. If /health fails too, we abort downstream.
         print(f"  [status] WARN: {'non-debug' if not group.debug else 'debug'} "
             f"group timed out at status=ready; deferring to /health "
             f"as authoritative liveness signal.", file=sys.stderr)
@@ -548,16 +600,14 @@ def run_one_group(matrix: dict, group: Group, args: argparse.Namespace,
             f"{'non-debug' if not group.debug else 'debug'}; deferring to /health"
         )
 
-    # 3. /health
-    print(f"\n[group/3] wait for /health")
+    print(f"\n[group/3] wait for /health AND /v1/models")
     t0 = time.monotonic()
     health_ok = wait_for_group_health(group, matrix, args)
     report["stages"]["health"] = {"wall_s": time.monotonic() - t0, "ok": health_ok}
     if not health_ok:
         delete_group(group, args)
-        return _abort("health", "/health timeout")
+        return _abort("health", "/health or /v1/models timeout")
 
-    # 4. Loop cells against the live deploy
     for i, cell in enumerate(group.cells):
         cell_report: dict[str, Any] = {
             "cell_id": cell["cell_id"],
@@ -574,7 +624,6 @@ def run_one_group(matrix: dict, group: Group, args: argparse.Namespace,
               f"driver={cell.get('driver','sequential')}) "
               f"--------")
 
-        # 4a. Drive
         t0 = time.monotonic()
         local_cmd = build_run_cell_local_cmd(matrix, cell, group)
         _print_cmd(local_cmd)
@@ -588,7 +637,6 @@ def run_one_group(matrix: dict, group: Group, args: argparse.Namespace,
         if rc != 0:
             cell_report["failed_at"] = "run_cell"
 
-        # 4b. Optional vllm bench reference (per-cell flag in YAML)
         if cell.get("vllm_bench_reference"):
             if rc != 0:
                 print(f"  [bench] skipped (run_cell failed)")
@@ -616,7 +664,6 @@ def run_one_group(matrix: dict, group: Group, args: argparse.Namespace,
         cell_report["ended"] = now_iso()
         report["cells"].append(cell_report)
 
-    # 5. Teardown
     print(f"\n[group/5] teardown {group.target_name}")
     t0 = time.monotonic()
     delete_ok = delete_group(group, args)
@@ -624,7 +671,6 @@ def run_one_group(matrix: dict, group: Group, args: argparse.Namespace,
         "wall_s": time.monotonic() - t0, "delete_ok": delete_ok,
     }
 
-    # Roll up status across cells
     statuses = [c["status"] for c in report["cells"]]
     if all(s == "ok" for s in statuses):
         report["status"] = "ok"
@@ -769,7 +815,6 @@ def main() -> int:
     for group in groups:
         group_report = run_one_group(matrix, group, args, out_dir)
         report["groups"].append(group_report)
-        # Persist after each group — partial runs leave durable state.
         (out_dir / "matrix_report.json").write_text(json.dumps(report, indent=2))
         if group_report["status"] != "ok" and args.on_fail == "abort":
             print(f"\n[matrix] ABORT — group {group_report['deploy_id']} "

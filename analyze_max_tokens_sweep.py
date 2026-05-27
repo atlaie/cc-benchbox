@@ -129,6 +129,28 @@ class SweepCell:
     max_new_tokens: int
     path: Path
 
+def load_ttft_cells(data_dir: Path) -> pd.DataFrame | None:
+    """Load baseline streaming + concurrent_c8 cells for the empirical
+    phase-split panel of figure_amortization. Returns None if the
+    directory has no usable cells."""
+    if not data_dir.exists():
+        return None
+    frames = []
+    specs = [
+        ("baseline", "streaming",     ["C1-off-stream", "C1-on-stream"]),
+        ("baseline", "concurrent_c8", ["C1-off-c8",     "C1-on-c8"]),
+    ]
+    for condition, regime, cells in specs:
+        for cid in cells:
+            p = data_dir / cid / "requests.parquet"
+            if not p.exists():
+                continue
+            df = pd.read_parquet(p)
+            df["condition"] = condition
+            df["regime"]    = regime
+            df["cc"]        = "off" if "-off" in cid else "on"
+            frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else None
 
 def discover_cells(data_dir: Path, prefix: str) -> list[SweepCell]:
     """Find all per-iteration subdirs under data_dir whose names match the
@@ -682,7 +704,8 @@ LABEL_PER_TOKEN_MS = "per-output-token\nCC overhead  (ms / token)"
 
 def figure_amortization(stats_list: list[CellStats], fit: FitResult,
                          fit2: TwoFeatureFitResult,
-                         df: pd.DataFrame, out_dir: Path) -> None:
+                         df: pd.DataFrame, out_dir: Path,
+                         ttft_df: pd.DataFrame | None = None) -> None:
     """Headline unified figure with three panels.
 
       LEFT (full height)
@@ -819,39 +842,41 @@ def figure_amortization(stats_list: list[CellStats], fit: FitResult,
     ax_l.set_ylim(bottom=0)
     ax_l.set_title("Wall time vs realised output length", pad=8)
 
-    # === TOP RIGHT: per-token overhead curve ============================
-    pt = np.array([s.per_token_overhead_ms for s in sl])
-    pt_lo = np.array([s.per_token_ci_low_ms for s in sl])
-    pt_hi = np.array([s.per_token_ci_high_ms for s in sl])
-
-    ax_tr.fill_between(x, pt_lo, pt_hi, color=PALETTE["on"], alpha=0.18, zorder=2)
-    ax_tr.plot(x, pt, "-o", color=PALETTE["on"], markersize=7,
-               markeredgecolor="white", markeredgewidth=1.1,
-               linewidth=2.2, zorder=3,
-               label="paired median (ms/token), 95% CI")
-
-    ax_tr.axhline(fit.delta_b * 1000, color=PALETTE["annotation"],
-                  linewidth=1.2, linestyle=":",
-                  alpha=0.8, zorder=2,
-                  label=fr"linear-fit asymptote  $\Delta b$ = "
-                        fr"{fit.delta_b * 1000:+.2f} ms/tok")
-
-    # Tight y-range focused on the data and the asymptote. The "CC tax is
-    # non-zero" message is implicit in the y-axis tick labels (60, 65, 70,
-    # …) — explicitly showing the zero line wastes ~60% of the panel on
-    # empty space because the data lives far from zero. Headroom on top is
-    # reserved for the legend.
-    y_pts = np.concatenate([pt_lo, pt_hi, np.array([fit.delta_b * 1000])])
-    y_lo, y_hi = float(y_pts.min()), float(y_pts.max())
-    span = max(y_hi - y_lo, 1.0)
-    ax_tr.set_ylim(y_lo - span * 0.18, y_hi + span * 0.55)
-
-    ax_tr.set_xlabel(LABEL_TOKENS, fontsize=9.5)
-    ax_tr.set_ylabel(LABEL_PER_TOKEN_MS, fontsize=9.5)
-    ax_tr.legend(loc="upper right", fontsize=8.5, framealpha=0.95)
-    ax_tr.set_xlim(left=0)
-    ax_tr.set_title("Per-token CC overhead vs realised output length",
-                    pad=6, fontsize=10.5)
+    # === TOP RIGHT: empirical phase split (replaces per-token overhead curve) ===
+    # The per-token-overhead curve we used to show here was visually
+    # informative but inferentially redundant with the left-panel fits and
+    # the bottom-right forest (all three are views of the same regression).
+    # The empirical phase split from streaming/concurrent baseline cells
+    # carries genuinely independent evidence — direct measurement, not
+    # regression — that the CC tax lands on decoding rather than prefill.
+    if ttft_df is not None and not ttft_df.empty:
+        _render_empirical_phase_bars(ax_tr, ttft_df)
+    else:
+        # Fall back to the per-token curve if no TTFT data was supplied.
+        # Backward-compatible: prior callers see no change.
+        pt    = np.array([s.per_token_overhead_ms for s in sl])
+        pt_lo = np.array([s.per_token_ci_low_ms for s in sl])
+        pt_hi = np.array([s.per_token_ci_high_ms for s in sl])
+        ax_tr.fill_between(x, pt_lo, pt_hi, color=PALETTE["on"], alpha=0.18, zorder=2)
+        ax_tr.plot(x, pt, "-o", color=PALETTE["on"], markersize=7,
+                   markeredgecolor="white", markeredgewidth=1.1,
+                   linewidth=2.2, zorder=3,
+                   label="paired median (ms/token), 95% CI")
+        ax_tr.axhline(fit.delta_b * 1000, color=PALETTE["annotation"],
+                      linewidth=1.2, linestyle=":",
+                      alpha=0.8, zorder=2,
+                      label=fr"linear-fit asymptote  $\Delta b$ = "
+                            fr"{fit.delta_b * 1000:+.2f} ms/tok")
+        y_pts = np.concatenate([pt_lo, pt_hi, np.array([fit.delta_b * 1000])])
+        y_lo, y_hi = float(y_pts.min()), float(y_pts.max())
+        span = max(y_hi - y_lo, 1.0)
+        ax_tr.set_ylim(y_lo - span * 0.18, y_hi + span * 0.55)
+        ax_tr.set_xlabel(LABEL_TOKENS, fontsize=9.5)
+        ax_tr.set_ylabel(LABEL_PER_TOKEN_MS, fontsize=9.5)
+        ax_tr.legend(loc="upper right", fontsize=8.5, framealpha=0.95)
+        ax_tr.set_xlim(left=0)
+        ax_tr.set_title("Per-token CC overhead vs realised output length",
+                        pad=6, fontsize=10.5)
 
     # === BOTTOM RIGHT: phase-decomposition forest =======================
     # Three parameters, each on its own row with its own x-scale because
@@ -945,6 +970,130 @@ def figure_amortization(stats_list: list[CellStats], fit: FitResult,
     _save(fig, fig_dir / "sweep_amortization")
     print(f"  wrote {fig_dir / 'sweep_amortization.{png,pdf}'}")
 
+def _render_empirical_phase_bars(
+    ax: plt.Axes,
+    ttft_df: pd.DataFrame,
+    regimes: tuple[str, ...] = ("streaming", "concurrent_c8"),
+) -> None:
+    """Horizontal stacked bars showing prefill (grey) + decode (teal) per
+    (regime, CC-state) pair. CC-off is encoded as a hatched fill, CC-on
+    as a solid fill — separating the off/on axis from the prefill/decode
+    colour axis. Regime headers sit immediately to the left of each
+    bar pair; Δprefill / Δdecode annotations sit immediately to the right.
+    """
+    color_prefill = PALETTE["off"]
+    color_decode  = PALETTE["on"]
+
+    rows = []
+    for regime in regimes:
+        for cc in ("off", "on"):
+            sub = ttft_df[(ttft_df["condition"] == "baseline")
+                          & (ttft_df["regime"] == regime)
+                          & (ttft_df["cc"] == cc)]
+            if sub.empty or "ttft_seconds" not in sub.columns:
+                continue
+            ttft = sub["ttft_seconds"].dropna().to_numpy()
+            wall = sub["wall_seconds"].dropna().to_numpy()
+            if len(ttft) == 0 or len(wall) == 0:
+                continue
+            rows.append({
+                "regime":    regime,
+                "cc":        cc,
+                "prefill_s": float(np.median(ttft)),
+                "decode_s":  float(np.median(wall) - np.median(ttft)),
+                "wall_s":    float(np.median(wall)),
+            })
+    if not rows:
+        ax.text(0.5, 0.5, "(no TTFT data available)",
+                ha="center", va="center", transform=ax.transAxes,
+                color=PALETTE["neutral"], fontsize=10)
+        ax.set_title("Empirical phase split", loc="left", pad=6, fontsize=10.5)
+        return
+    pdf = pd.DataFrame(rows)
+    present = [r for r in regimes if r in pdf["regime"].unique()]
+
+    # Layout — each regime takes 2 rows (off, on), separated by a gap.
+    bar_h = 0.62
+    intra = 1.00   # spacing within a regime pair (off→on)
+    inter = 0.80   # extra gap between regime pairs
+    bar_specs: list[dict] = []
+    group_centers: list[tuple[str, float]] = []
+    y = 0.0
+    for regime in present:
+        start = y
+        for cc in ("off", "on"):
+            row = pdf[(pdf["regime"] == regime) & (pdf["cc"] == cc)]
+            if row.empty:
+                continue
+            r = row.iloc[0]
+            bar_specs.append({
+                "y": y, "regime": regime, "cc": cc,
+                "prefill_s": r["prefill_s"], "decode_s": r["decode_s"],
+                "wall_s":   r["wall_s"],
+            })
+            y += intra
+        end = y - intra
+        group_centers.append((regime, (start + end) / 2))
+        y += inter
+
+    # Bars.
+    for i, s in enumerate(bar_specs):
+        hatch = "////" if s["cc"] == "off" else None
+        ax.barh(s["y"], s["prefill_s"], bar_h,
+                color=color_prefill, edgecolor=PALETTE["annotation"],
+                linewidth=0.7, hatch=hatch, zorder=2,
+                label="prefill (TTFT)" if i == 0 else None)
+        ax.barh(s["y"], s["decode_s"], bar_h, left=s["prefill_s"],
+                color=color_decode, edgecolor=PALETTE["annotation"],
+                linewidth=0.7, hatch=hatch, zorder=2,
+                label="decoding" if i == 0 else None)
+
+    # Y-tick labels: CC-off / CC-on as the row identity.
+    ax.set_yticks([s["y"] for s in bar_specs])
+    ax.set_yticklabels([f"CC-{s['cc']}" for s in bar_specs], fontsize=9.5)
+    ax.invert_yaxis()    # first regime at top — top-to-bottom reading order
+    ax.tick_params(axis="y", length=0, pad=4)
+
+    # Regime headers to the left (outside the data area), bold, at the
+    # vertical centre of each bar pair. Drawn in axis-fraction x so they
+    # always sit just outside the y-axis regardless of data range.
+    for regime, cy in group_centers:
+        ax.text(-0.20, cy,
+                "streaming" if regime == "streaming" else "concurrent c=8",
+                transform=ax.get_yaxis_transform(),
+                ha="right", va="center",
+                fontsize=10.5, fontweight="bold",
+                color=PALETTE["annotation"])
+
+    # Δ annotations to the right of each regime pair, vertically centred.
+    for regime, cy in group_centers:
+        off_s = next((s for s in bar_specs
+                      if s["regime"] == regime and s["cc"] == "off"), None)
+        on_s  = next((s for s in bar_specs
+                      if s["regime"] == regime and s["cc"] == "on"),  None)
+        if off_s is None or on_s is None:
+            continue
+        d_pref_ms = (on_s["prefill_s"] - off_s["prefill_s"]) * 1000
+        d_dec_ms  = (on_s["decode_s"]  - off_s["decode_s"])  * 1000
+        ax.text(on_s["wall_s"] + 0.4, cy,
+                f"$\\Delta$decode  = {d_dec_ms:+5.0f} ms\n"
+                f"$\\Delta$prefill = {d_pref_ms:+5.0f} ms",
+                ha="left", va="center", fontsize=8.8,
+                color=PALETTE["annotation"],
+                family="DejaVu Sans Mono",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                          edgecolor="#CCCCCC", linewidth=0.6, alpha=0.95))
+
+    # X-axis with headroom for the Δ annotations.
+    ax.set_xlabel("wall p50 (s)", fontsize=9.5)
+    max_wall = pdf["wall_s"].max()
+    ax.set_xlim(0, max_wall * 1.55)
+
+    ax.legend(loc="lower right", fontsize=8.5, framealpha=0.95, ncol=2)
+    ax.set_title("Empirical phase split  (baseline cells, n=50 each)",
+                 fontsize=10.5, loc="left", pad=6)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
 def figure_overhead_pct(stats_list: list[CellStats], out_dir: Path) -> None:
     """The amortisation curve in percent: Δ% vs tokens_out_p50.
@@ -1066,6 +1215,12 @@ def main() -> int:
                     help="Match the prefix you passed to the sweep. Default C1.")
     ap.add_argument("--n-resamples", type=int, default=10_000)
     ap.add_argument("--alpha", type=float, default=0.05)
+    ap.add_argument(
+        "--ttft-data-dir", type=Path, default=None,
+        help="Optional. Directory containing C1-(off|on)-(stream|c8)/requests.parquet "
+             "for the empirical phase-split panel that replaces the per-token-overhead "
+             "panel in the headline figure. Skipped if omitted.",
+    )
     args = ap.parse_args()
 
     print(f"Discovering sweep cells under {args.data_dir} "
@@ -1113,7 +1268,16 @@ def main() -> int:
     write_tables(stats_list, fit, fit2, args.output_dir)
 
     print(f"\nGenerating figures...")
-    figure_amortization(stats_list, fit, fit2, df, args.output_dir)
+    ttft_df = None
+    if args.ttft_data_dir is not None:
+        ttft_df = load_ttft_cells(args.ttft_data_dir)
+        if ttft_df is not None:
+            print(f"  loaded {len(ttft_df)} TTFT rows for empirical phase panel")
+        else:
+            print(f"  [warn] no TTFT cells found under {args.ttft_data_dir}; "
+                  f"falling back to per-token overhead panel")
+
+    figure_amortization(stats_list, fit, fit2, df, args.output_dir, ttft_df=ttft_df)
     figure_overhead_pct(stats_list, args.output_dir)
     figure_eos_distribution(df, args.output_dir)
 

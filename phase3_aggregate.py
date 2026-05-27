@@ -50,6 +50,10 @@ from typing import Any, Optional
 
 import numpy as np
 
+from phase3_aggregate_egress import (
+    egress_cell_summary, egress_breakdown, render_egress_section,
+)
+
 try:
     import pandas as pd  # type: ignore
 except ImportError:
@@ -464,6 +468,7 @@ def cell_summary(cell: dict[str, Any]) -> dict[str, Any]:
     out["request_throughput_req_per_s"] = aligned.get("request_throughput_req_per_s")
     out["output_token_throughput_tok_per_s"] = aligned.get("output_token_throughput_tok_per_s")
 
+    out["egress"] = egress_cell_summary(cell)
     if "requests" not in cell:
         # No request data; still try to surface gpu_memory if it landed.
         out["burst_write"] = {"available": False}
@@ -522,6 +527,11 @@ def _safe_pct(numerator: Optional[float], denominator: Optional[float]) -> Optio
 def cc_overhead_table(cell_summaries: list[dict]) -> list[dict]:
     """Pair CC-on / CC-off cells by condition, compute deltas on headline metrics."""
     by_condition: dict[str, dict[str, dict]] = {}
+    cell_summaries = [
+        c for c in cell_summaries
+        if not (c.get("egress") or {}).get("available")
+        and not (c.get("cell_id") or "").endswith("-via-egress")
+    ]
     for cs in cell_summaries:
         cond = cs.get("condition")
         cc = cs.get("cc_state")
@@ -892,6 +902,7 @@ def render_markdown(agg: dict[str, Any]) -> str:
         lines.append("")
 
     # --- Phase 2 sanity check (unchanged) ---
+    lines.append(render_egress_section(agg))
     lines.append("## Phase 2 sanity check (CC-off cells)")
     lines.append("")
     lines.append(f"Tolerances per `PHASE3_PLAN §12`: ±{int(PHASE2_WALL_TOLERANCE*100)}% on "
@@ -1058,6 +1069,7 @@ def main() -> int:
     p2_rows = phase2_sanity(cell_summaries, args.phase2_dir)
     bench_rows = bench_comparison(cell_summaries, cells_data, args.cache_dir)
     conc_rows = concurrent_comparison(cell_summaries)
+    egress_rows = egress_breakdown(cell_summaries)
 
     agg = {
         "schema_version": SCHEMA_VERSION,
@@ -1067,7 +1079,8 @@ def main() -> int:
         "cc_overhead": cc_rows,
         "phase2_check": p2_rows,
         "bench_comparison": bench_rows,
-        "concurrent_comparison": conc_rows,   # NEW
+        "concurrent_comparison": conc_rows,
+        "egress_breakdown": egress_rows,
     }
 
     (args.out_dir / "aggregate.json").write_text(json.dumps(agg, indent=2, default=str))

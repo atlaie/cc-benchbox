@@ -138,7 +138,7 @@ def main():
                          "50 prompts, matches Phase 2/3 N=50 convention).")
     ap.add_argument("--seed", type=int, default=0,
                     help="Random seed for reproducibility (default 0).")
-    ap.add_argument("--out", type=Path, default=Path("pairs-gsm8k.json"),
+    ap.add_argument("--out", type=Path, default=Path("data/pairs-gsm8k.json"),
                     help="Output JSON path. Driver's load_pairs() expects "
                          "a single JSON array, NOT JSONL. Default "
                          "pairs-gsm8k.json.")

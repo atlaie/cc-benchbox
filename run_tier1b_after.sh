@@ -12,15 +12,15 @@ echo "[$(date)] C3-off matrix finished."
 # Pre-flight: confirm the YAML has the Tier 1B cells before chewing
 # through a 30-min deploy and finding out it doesn't.
 for cell in C1-off-attest C1-on-attest; do
-    if ! grep -q "cell_id: $cell" phase3-matrix.yaml; then
-        echo "[$(date)] FATAL: $cell not found in phase3-matrix.yaml" >&2
+    if ! grep -q "cell_id: $cell" configs/phase3-matrix.yaml; then
+        echo "[$(date)] FATAL: $cell not found in configs/phase3-matrix.yaml" >&2
         exit 3
     fi
 done
 echo "[$(date)] YAML pre-flight ok. Launching Tier 1B."
 
 python phase3_run_matrix.py \
-    --matrix phase3-matrix.yaml \
+    --matrix configs/phase3-matrix.yaml \
     --only-cells C1-off-attest,C1-on-attest \
     --out-dir runs/phase3
 EXIT_CODE=$?

@@ -47,9 +47,9 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--existing-pairs", type=Path, default=Path("pairs.json"),
+    ap.add_argument("--existing-pairs", type=Path, default=Path("data/pairs.json"),
                     help="Existing pairs file used to verify schema match")
-    ap.add_argument("--output", type=Path, default=Path("pairs-500.json"))
+    ap.add_argument("--output", type=Path, default=Path("data/pairs-500.json"))
     ap.add_argument("--n-rows", type=int, default=250,
                     help="Number of (toxic, benign) rows to emit. "
                          "Total prompts = 2 x n_rows.")

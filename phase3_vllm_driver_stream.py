@@ -14,11 +14,19 @@ or the field is irrelevant):
   itl_p95_seconds    95th-pct inter-chunk gap
   n_chunks           total SSE `data:` events received
 
-Wire format identical to phase3_vllm_driver: same extra_body, same
-vllm_xargs, same chat_template_kwargs. Differences:
+Wire format identical to phase3_vllm_driver: same vllm_xargs, same
+chat_template_kwargs threading. Differences:
   - "stream": true
   - "stream_options": {"include_usage": true} so the final chunk carries
     the usage block (tokens_in / tokens_out).
+
+PATCH NOTE (2026-05-27):
+  Added --enable-thinking CLI plumbing. Prior to this patch
+  chat_template_kwargs.enable_thinking was hardcoded False in both the
+  streaming request body and the summary metadata, which caused the
+  Tier 3G replication run on this driver to silently fall back to
+  direct-answer mode (tok_out_p50 ≈ 175 vs v1's 594). Default still
+  False; pass --enable-thinking to activate.
 
 CAUTION (verify before relying on instrumented streaming cells): vLLM's
 behavior under stream=true with vllm_xargs payloads (residual stream,
@@ -51,6 +59,18 @@ Full streaming cell (50 requests):
       --out-dir runs/phase3/C1-off-stream \\
       --cell-id C1-off-stream --cc-state off \\
       --image-digest sha256:<digest>
+
+Thinking-mode (Tier 3G replication):
+
+  python phase3_vllm_driver_stream.py \\
+      --condition baseline \\
+      --base-url ... --api-key "$VLLM_API_KEY" \\
+      --pairs-json pairs-gsm8k.json \\
+      --n-requests 50 --max-new-tokens 2272 \\
+      --enable-thinking \\
+      --timeout 1000 \\
+      --out-dir runs/phase3_v2/C_R-off \\
+      --cell-id C_R-off --cc-state off
 
 Exit codes:
   0  success
@@ -144,6 +164,7 @@ def send_one_stream(
     request_id: int,
     pair_id: int,
     prompt_class: str,
+    enable_thinking: bool = False,   # NEW (patch 2026-05-27)
     timeout: float = 600.0,
 ) -> RequestRow:
     """One streaming /v1/chat/completions call.
@@ -169,7 +190,7 @@ def send_one_stream(
         "stream": True,
         "stream_options": {"include_usage": True},
         "vllm_xargs": xargs,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
     }
     url = f"{base_url.rstrip('/')}/chat/completions"
 
@@ -272,7 +293,8 @@ def run_cell(
     max_new_tokens: int,
     req_rate: float,
     timeout: float = 600.0,
-    warmup_requests: int = 2,                # NEW
+    warmup_requests: int = 2,
+    enable_thinking: bool = False,   # NEW (patch 2026-05-27)
 ) -> list[RequestRow]:
     # Warmup: fire `warmup_requests` requests with the first prompt(s) and
     # discard. Quenches first-request cold-cache penalty.
@@ -283,6 +305,7 @@ def run_cell(
             warm_row = send_one_stream(
                 base_url, api_key, model, warm_prompt, xargs, max_new_tokens,
                 request_id=-1 - w, pair_id=-1, prompt_class="warmup",
+                enable_thinking=enable_thinking,
                 timeout=timeout,
             )
             ttft_str = (f"ttft={warm_row.ttft_seconds:.3f}s"
@@ -300,6 +323,7 @@ def run_cell(
         row = send_one_stream(
             base_url, api_key, model, prompt, xargs, max_new_tokens,
             request_id=i, pair_id=pair_id, prompt_class=prompt_class,
+            enable_thinking=enable_thinking,
             timeout=timeout,
         )
         rows.append(row)
@@ -357,6 +381,7 @@ def summarize(
     req_rate: float,
     n_requests_target: int,
     xargs: dict,
+    enable_thinking: bool = False,   # NEW (patch 2026-05-27)
 ) -> dict:
     ok = [r for r in rows if r.error is None]
     err = [r for r in rows if r.error is not None]
@@ -378,7 +403,7 @@ def summarize(
             "stream": True,
             "stream_options": {"include_usage": True},
             "temperature": 0.0,
-            "chat_template_kwargs": {"enable_thinking": False},
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
         },
         "req_rate": req_rate,
         "n_requests_target": n_requests_target,
@@ -467,6 +492,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-health", action="store_true")
     p.add_argument("--warmup-requests", type=int, default=2,
                help="Throwaway requests before measurement to quench cold-cache penalty.")
+    p.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=False,
+        help=(
+            "Set chat_template_kwargs.enable_thinking=True. Default "
+            "False matches the hardcoded value used by all primary-"
+            "matrix streaming cells. Enable for reasoning-mode cells "
+            "(Tier 3G replication on GSM8K)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -490,6 +526,7 @@ def main() -> int:
     print(f"[cell] {args.cell_id} (cc={args.cc_state}) condition={args.condition} STREAMING")
     print(f"[cell] target={args.base_url} model={args.model}")
     print(f"[cell] xargs={xargs}")
+    print(f"[cell] enable_thinking={args.enable_thinking}")
     print(f"[cell] {len(prompts)} requests @ {req_rate} req/s "
           f"(min wall ~{len(prompts) / req_rate / 60:.1f} min)")
 
@@ -510,6 +547,7 @@ def main() -> int:
         xargs=xargs, max_new_tokens=args.max_new_tokens,
         req_rate=req_rate, timeout=args.timeout,
         warmup_requests=args.warmup_requests,
+        enable_thinking=args.enable_thinking,
     )
     elapsed_min = (time.monotonic() - t0) / 60.0
     print(f"[run] complete in {elapsed_min:.1f} min")
@@ -524,6 +562,7 @@ def main() -> int:
         req_rate=req_rate,
         n_requests_target=args.n_requests,
         xargs=xargs,
+        enable_thinking=args.enable_thinking,
     )
 
     req_path = write_outputs(rows, summary, args.out_dir)

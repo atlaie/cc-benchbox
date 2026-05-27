@@ -147,7 +147,7 @@ CONDITION_DISPLAY = {
     "repe_bundle":       "repe_bundle",
     "gradient":          "gradient",
     "routing":           "routing",
-    "steer":             "steer (EII-4)",
+    "steer":             "steer",
 }
 
 # Set of all conditions that share the "baseline workload" semantics — used to
@@ -789,25 +789,23 @@ def _row_color(condition: str) -> str:
 
 
 def figure_forest(deltas: pd.DataFrame, out_dir: Path) -> None:
-    """Headline figure: CC wall_p50 delta with paired BCa CI per cell.
+    """Headline figure: per-cell CC delta in relative and absolute terms.
 
-      LEFT panel — relative CC overhead (%) with paired-BCa 95% CIs per row.
-      Shaded +33-38% empirical platform band behind the data. Cropped x-axis
-      to the data range. No inline annotations.
+    LEFT panel  — relative CC overhead (%) on wall_p50 with paired-BCa 95% CIs.
+                  Empirical +33-38% platform band shaded behind the data.
+    RIGHT panel — absolute wall_p50 (s) as a dumbbell from CC-off to CC-on.
+                  Hollow circle = CC-off, filled circle = CC-on; both in the
+                  row's condition colour. Dumbbell length encodes the absolute
+                  delta; no separate annotation is needed.
 
-      RIGHT panel — dumbbell of absolute p_{50}(t_wall) (s): for each row,
-      a grey CC-off marker and a teal CC-on marker, connected by a thin
-      line in the row's condition colour. Absolute Δ (in seconds) labelled
-      to the right of the CC-on marker. Shared y-axis with the left panel
-      so the dumbbells line up row-for-row with the CIs.
+    Both panels share row order (baseline family first in canonical block
+    order, then instrumented conditions sorted by relative CC delta) and a
+    single colour axis: condition. CC state is encoded as marker fill, never
+    as colour. A thick (1.6pt) separator divides the two row blocks, matching
+    the convention used in figure_delta_heatmap_exec.
 
-    The two-panel design separates "how big is the CC tax in relative terms"
-    (left) from "how big is it in absolute terms" (right). The reader sees
-    that gradient (+58.1%) and repe_bundle (+9.0%) translate to ~2.7s and
-    ~1.3s absolute deltas respectively — comparable in seconds, not in %.
-
-    Only n=50 rows (the streaming cells) carry an explicit "(n=50)" tag;
-    n=100 is the default and described in the caption rather than inline.
+    Streaming cells have n=50; all others n=100 — noted in the caption rather
+    than inline, to keep the figure free of per-row annotation noise.
     """
     fig_dir = out_dir / "figures"
     sub = deltas[deltas["metric"] == "wall_p50"].copy()
@@ -815,53 +813,42 @@ def figure_forest(deltas: pd.DataFrame, out_dir: Path) -> None:
         return
     sub["label"] = [_disp_label(c, r) for c, r in zip(sub["condition"], sub["regime"])]
 
-    # Row ordering (unchanged from v2.5).
-    baseline_keys: list[tuple[str, str]] = [
-        ("baseline",         "sequential"),
-        ("baseline",         "streaming"),
-        ("baseline",         "concurrent_c8"),
-        ("baseline_70b",     "sequential"),
-        ("baseline_70b_tp1", "sequential"),
-        ("baseline_harmbench", "sequential"),
-    ]
-    baseline_order = [_disp_label(c, r) for c, r in baseline_keys]
-    instr_src = sub[~sub["condition"].isin(BASELINE_CONDITIONS)].sort_values("rel_delta_pct")
-    instr_order = instr_src["label"].tolist()
-    order = [lbl for lbl in baseline_order + instr_order if lbl in sub["label"].unique()]
+    # Row ordering ---------------------------------------------------------
+    # Row ordering: sort by CC-off baseline wall_p50, ascending — fastest
+    # at top, slowest at bottom. The GLM/Llama two-tone colour scheme
+    # carries the architectural grouping that the prior family/instrumented
+    # split anchored visually.
+    order = sub.sort_values("off_point")["label"].tolist()
 
     m = sub.set_index("label").reindex(order)
     y = np.arange(len(order))
     valid = m["rel_delta_pct"].notna().to_numpy()
     label_to_cond = dict(zip(sub["label"], sub["condition"]))
-    colors = [_row_color(label_to_cond.get(lbl, "")) for lbl in order]
-
-    # Pull paired-bootstrap n; only annotate non-default (n != 100) values.
-    n_p = m["n_paired"].to_numpy() if "n_paired" in m.columns else np.full(len(order), 100)
+    LLAMA_COLOR     = "#EE7733"          # Paul Tol orange  — Llama (cross-architecture check)
+    GLM_BASE_COLOR  = PALETTE["on"]      # teal             — GLM baseline (anchors the +33-38% band)
+    GLM_INSTR_COLOR = "#4477AA"          # Paul Tol blue    — GLM instrumented (tests against the band)
+    def _row_color3(cond: str) -> str:
+        if cond.startswith("baseline_70b"):
+            return LLAMA_COLOR
+        if cond in BASELINE_CONDITIONS:
+            return GLM_BASE_COLOR
+        return GLM_INSTR_COLOR
+    colors = [_row_color3(label_to_cond.get(lbl, "")) for lbl in order]
     off_p = m["off_point"].to_numpy()
     on_p  = m["on_point"].to_numpy()
 
-    # === Figure layout ====================================================
+    # Figure layout --------------------------------------------------------
     fig, (ax_l, ax_r) = plt.subplots(
-        1, 2, figsize=(14.0, 0.68 * len(order) + 2.4),
-        gridspec_kw={"width_ratios": [1.0, 0.95], "wspace": 0.06},
+        1, 2, figsize=(13.0, 0.60 * len(order) + 2.2),
+        gridspec_kw={"width_ratios": [1.0, 0.80], "wspace": 0.04},
         sharey=True,
     )
 
-    # === LEFT PANEL: relative CC overhead (%) ============================
+    # === LEFT PANEL: relative CC overhead (%) ===========================
     ax_l.axvspan(CC_BAND_PCT[0], CC_BAND_PCT[1],
-                 color=PALETTE["muted"], alpha=0.32, zorder=0)
-    # Inline band label, anchored in axes fraction coordinates at bottom-left
-    # so it's always visible regardless of data scale and never clipped by
-    # the figure edge.
-    ax_l.text(0.015, 0.015,
-              f"shaded: platform CC band ({CC_BAND_PCT[0]:.0f}-{CC_BAND_PCT[1]:.0f}%)",
-              transform=ax_l.transAxes,
-              ha="left", va="bottom", fontsize=10, color=PALETTE["neutral"],
-              fontstyle="italic",
-              bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
-                        edgecolor="#DDDDDD", linewidth=0.5, alpha=0.92))
+                 color=PALETTE["muted"], alpha=0.28, zorder=0)
     ax_l.axvline(0, color=PALETTE["neutral"], linewidth=1.0, linestyle="--",
-                 alpha=0.6, zorder=1)
+                 alpha=0.55, zorder=1)
 
     x_vals  = m["rel_delta_pct"].to_numpy()
     xerr_lo = (m["rel_delta_pct"] - m["rel_ci_low_pct"]).to_numpy()
@@ -871,79 +858,69 @@ def figure_forest(deltas: pd.DataFrame, out_dir: Path) -> None:
             continue
         ax_l.errorbar([x_vals[i]], [y[i]],
                       xerr=[[xerr_lo[i]], [xerr_hi[i]]],
-                      fmt="o", capsize=5, color=c, ecolor=c,
-                      markersize=8.0, linewidth=2.6, capthick=2.2, zorder=3)
-        # Inline % label right of the CI bar.
+                      fmt="o", capsize=4, color=c, ecolor=c,
+                      markersize=7.5, linewidth=2.4, capthick=2.0, zorder=3)
         lo, hi = m["rel_ci_low_pct"].iat[i], m["rel_ci_high_pct"].iat[i]
-        ax_l.text(hi + 0.8, y[i],
+        ax_l.text(hi + 0.9, y[i],
                   f"{x_vals[i]:+.1f}%  [{lo:+.1f}, {hi:+.1f}]",
                   va="center", ha="left", fontsize=10.5, color=c)
-
-    # Group separator
-    n_baseline = sum(1 for lbl in order if lbl in baseline_order)
-    if 0 < n_baseline < len(order):
-        ax_l.axhline(n_baseline - 0.5, color=PALETTE["muted"], linewidth=0.8,
-                     linestyle=":", alpha=0.8, zorder=0)
-
+    # Colour legend explaining the three-tone row scheme.
+    from matplotlib.patches import Patch
+    color_legend = [
+        Patch(facecolor=GLM_BASE_COLOR,  edgecolor="white", label="GLM-5.1 baseline"),
+        Patch(facecolor=GLM_INSTR_COLOR, edgecolor="white", label="GLM-5.1 instrumented"),
+        Patch(facecolor=LLAMA_COLOR,     edgecolor="white", label="Llama-3.1-70B"),
+    ]
+    ax_l.legend(handles=color_legend, loc="lower right",
+                framealpha=0.95, fontsize=10)
     lo_arr = m["rel_ci_low_pct"].to_numpy()[valid]
     hi_arr = m["rel_ci_high_pct"].to_numpy()[valid]
     ax_l.set_xlim(min(-3.0, float(lo_arr.min()) - 2.0),
                   float(hi_arr.max()) + 30.0)
     ax_l.set_xlabel(LABEL_WALL_P50_PCT)
     ax_l.set_yticks(y)
-    ax_l.set_yticklabels(order)
+    ax_l.set_yticklabels([lbl.replace(" / sequential", "") for lbl in order], fontsize = 14)
+    ax_l.set_xticklabels(labels = plt.gca().get_xticklabels(), fontsize = 14)
 
-    # === RIGHT PANEL: absolute wall_p50 dumbbell ========================
-    ax_r.axhline(n_baseline - 0.5, color=PALETTE["muted"], linewidth=0.8,
-                 linestyle=":", alpha=0.8, zorder=0)
     for i in range(len(order)):
         if not valid[i] or np.isnan(off_p[i]) or np.isnan(on_p[i]):
             continue
-        # Connecting line in the row's condition colour (visually couples
-        # this row to its colour on the left panel).
+        # Connecting line in the row's condition colour.
         ax_r.hlines(y[i], off_p[i], on_p[i],
-                     color=colors[i], linewidth=2.6, alpha=0.45, zorder=2)
-        # Markers: CC-off (grey) and CC-on (teal). Marker colour encodes
-        # CC state; line colour encodes condition.
-        ax_r.scatter([off_p[i]], [y[i]], color=PALETTE["off"], s=90,
-                      edgecolor="white", linewidth=1.4, zorder=4)
-        ax_r.scatter([on_p[i]], [y[i]],  color=PALETTE["on"],  s=90,
-                      edgecolor="white", linewidth=1.4, zorder=4)
-        # Absolute-Δ annotation to the right of the CC-on marker.
-        d_abs = on_p[i] - off_p[i]
-        ax_r.text(on_p[i] + 0.25, y[i],
-                  f"$\\Delta$ = {d_abs:+.2f} s",
-                  va="center", ha="left", fontsize=10.5, color=colors[i])
-        # n=50 tag only for the streaming rows.
-        if int(n_p[i]) == 50:
-            mid_x = (off_p[i] + on_p[i]) / 2
-            ax_r.text(mid_x, y[i] + 0.30, "(n = 50)",
-                       va="bottom", ha="center", fontsize=9.5,
-                       color=PALETTE["neutral"], fontstyle="italic")
+                    color=colors[i], linewidth=2.8, alpha=0.65, zorder=2)
+        # Hollow = CC-off, filled = CC-on. Both in condition colour.
+        ax_r.scatter([off_p[i]], [y[i]], facecolor="white",
+                     edgecolor=colors[i], linewidth=2.2, s=82, zorder=4)
+        ax_r.scatter([on_p[i]], [y[i]], facecolor=colors[i],
+                     edgecolor=colors[i], linewidth=1.6, s=82, zorder=4)
 
-    # CC-off / CC-on legend (right panel only — the markers are universal).
+    # Marker-shape legend: encodes CC state without introducing a colour.
     from matplotlib.lines import Line2D
     legend_handles = [
-        Line2D([0], [0], marker="o", linestyle="none", color="none",
-                markerfacecolor=PALETTE["off"], markeredgecolor="white",
-                markeredgewidth=1.2, markersize=10, label="CC-off"),
-        Line2D([0], [0], marker="o", linestyle="none", color="none",
-                markerfacecolor=PALETTE["on"], markeredgecolor="white",
-                markeredgewidth=1.2, markersize=10, label="CC-on"),
+        Line2D([0], [0], marker="o", linestyle="none",
+               markerfacecolor="white",
+               markeredgecolor=PALETTE["annotation"],
+               markeredgewidth=2.0, markersize=9, label="CC-off"),
+        Line2D([0], [0], marker="o", linestyle="none",
+               markerfacecolor=PALETTE["annotation"],
+               markeredgecolor=PALETTE["annotation"],
+               markeredgewidth=1.6, markersize=9, label="CC-on"),
     ]
     ax_r.legend(handles=legend_handles, loc="lower right",
-                framealpha=0.95, fontsize=10.5)
+                framealpha=0.95, fontsize=14)
 
-    # Right-panel x-axis: linear, starts at 0 (honest absolute scale)
     all_vals = np.concatenate([off_p[valid], on_p[valid]])
-    pad = (all_vals.max() - 0.0) * 0.18
+    pad = all_vals.max() * 0.05
     ax_r.set_xlim(0.0, all_vals.max() + pad)
     ax_r.set_xlabel(LABEL_WALL_P50_S)
-    # Hide y-axis on the right panel (shared with left)
+    ax_r.set_xticklabels(labels = plt.gca().get_xticklabels(), fontsize = 14)
     ax_r.tick_params(axis="y", left=False, labelleft=False)
 
-    fig.suptitle("CC overhead per cell — relative (left) and absolute (right)",
-                 fontsize=13.5, y=1.00)
+    # Two-line title matching figure_delta_heatmap_exec / figure_phase_decomposition.
+    fig.suptitle(
+        "Relative and absolute CC overhead per cell",weight = 'bold',
+        fontsize=11.5, y=1.005,
+    )
     plt.tight_layout()
     _save(fig, fig_dir / "forest")
     print(f"  wrote {fig_dir / 'forest.{png,pdf}'}")
