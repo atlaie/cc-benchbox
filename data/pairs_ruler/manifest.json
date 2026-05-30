@@ -1,0 +1,128 @@
+{
+  "schema_version": "ruler-pairs-v1",
+  "tokenizer": "zai-org/GLM-5.1-FP8",
+  "enable_thinking": false,
+  "template_overhead_tokens": 5,
+  "haystack_path": "ruler_haystack.txt",
+  "haystack_md5": "21b2a333e33a861f702e5075fea94a59",
+  "haystack_n_tokens": 102335,
+  "seed": 42,
+  "pairs_per_target": 50,
+  "targets": [
+    {
+      "tok_in_target": 100,
+      "n_pairs": 50,
+      "pairs_file": "pairs_t100.json",
+      "pair_id_range": [
+        12000,
+        12049
+      ],
+      "actual_tok_in": {
+        "mean": 99.91,
+        "min": 98,
+        "max": 102,
+        "stdev": 1.2956414892580699
+      },
+      "diff_from_target": {
+        "mean": -0.09,
+        "min": -2,
+        "max": 2,
+        "n_within_2": 100,
+        "n_within_10": 100
+      },
+      "build_seconds": 0.1069082499598153
+    },
+    {
+      "tok_in_target": 500,
+      "n_pairs": 50,
+      "pairs_file": "pairs_t500.json",
+      "pair_id_range": [
+        16000,
+        16049
+      ],
+      "actual_tok_in": {
+        "mean": 500.04,
+        "min": 498,
+        "max": 502,
+        "stdev": 1.3097921802925667
+      },
+      "diff_from_target": {
+        "mean": 0.04,
+        "min": -2,
+        "max": 2,
+        "n_within_2": 100,
+        "n_within_10": 100
+      },
+      "build_seconds": 0.5987437079893425
+    },
+    {
+      "tok_in_target": 1000,
+      "n_pairs": 50,
+      "pairs_file": "pairs_t1000.json",
+      "pair_id_range": [
+        21000,
+        21049
+      ],
+      "actual_tok_in": {
+        "mean": 999.83,
+        "min": 998,
+        "max": 1002,
+        "stdev": 1.3710940849916136
+      },
+      "diff_from_target": {
+        "mean": -0.17,
+        "min": -2,
+        "max": 2,
+        "n_within_2": 100,
+        "n_within_10": 100
+      },
+      "build_seconds": 1.725037916970905
+    },
+    {
+      "tok_in_target": 4000,
+      "n_pairs": 50,
+      "pairs_file": "pairs_t4000.json",
+      "pair_id_range": [
+        51000,
+        51049
+      ],
+      "actual_tok_in": {
+        "mean": 3999.96,
+        "min": 3998,
+        "max": 4002,
+        "stdev": 1.3251262566108921
+      },
+      "diff_from_target": {
+        "mean": -0.04,
+        "min": -2,
+        "max": 2,
+        "n_within_2": 100,
+        "n_within_10": 100
+      },
+      "build_seconds": 5.9672757079824805
+    },
+    {
+      "tok_in_target": 8000,
+      "n_pairs": 50,
+      "pairs_file": "pairs_t8000.json",
+      "pair_id_range": [
+        91000,
+        91049
+      ],
+      "actual_tok_in": {
+        "mean": 7999.89,
+        "min": 7998,
+        "max": 8002,
+        "stdev": 1.1182146665126695
+      },
+      "diff_from_target": {
+        "mean": -0.11,
+        "min": -2,
+        "max": 2,
+        "n_within_2": 100,
+        "n_within_10": 100
+      },
+      "build_seconds": 16.07755541597726
+    }
+  ]
+}

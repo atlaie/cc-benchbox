@@ -1,0 +1,155 @@
+# =====================================================================
+# phase3-matrix-tier1a-v2.yaml
+# Tier 1A v2 — max_tokens sweep replication via phase3_run_matrix.py
+# =====================================================================
+#
+# Replaces the phase3_sweep_max_tokens.py invocation. Two reasons:
+#   1. phase3_sweep_max_tokens.py uses the non-streaming sequential
+#      dispatch via vllm_drv.run_cell; can't add SSE without source
+#      changes. The edge / NAT closes non-streaming HTTPS connections
+#      after ~60s idle (observed 2026-05-26), which kills every
+#      max_tok>=512 cell mid-generation.
+#   2. phase3_run_matrix.py supports `driver: stream` per cell, which
+#      keeps the TCP connection active with continuous SSE chunks at
+#      ~5 tokens/s. No idle timeout possible.
+#
+# Same image, same prompts (ToxicChat pairs.json), same n_requests per
+# max_tokens cell as v1 (brief Table 5: 100/100/50/20/10), same
+# req_rate (0.15 r/s, GLM cell convention from brief §A). Methodology
+# diff vs v1: streaming wall_seconds has ~50ms SSE setup overhead
+# perturbing the intercept; per-token slope unchanged.
+#
+# Cell IDs (C1-off-tNN, C1-on-tNN) match analyze_max_tokens_sweep.py's
+# regex pattern `^([A-Za-z0-9]+)-(off|on)-t(\d+)$` so the analysis
+# script consumes v2 parquets without modification.
+#
+# Grouping (v3): 10 cells → 2 deploys.
+#   group (vllm, off, debug): C1-off-t{32,128,512,1024,2048}  → 1 deploy
+#   group (vllm, on,  debug): C1-on-t{32,128,512,1024,2048}   → 1 deploy
+# Both arms amortise the ~15-min GLM-5.1-FP8 model load across all five
+# max_tokens cells (matches phase3_sweep_max_tokens.py's amortisation).
+#
+# Brief reference: §4.2, Tables 5/7.  Plan reference: ROBUSTNESS_PLAN.md §4.3.
+# ---------------------------------------------------------------------
+
+schema_version: 3
+
+org_subdomain: pour-demain
+tinfoil_host: control.inf8.tinfoil.sh
+
+benchbox:
+  scripts_dir: .
+  pairs_json: pairs.json
+  out_dir: runs/phase3_v2/max_tokens_sweep
+
+defaults:
+  model: glm-5-1-fp8
+  n_requests: 100
+  max_new_tokens: 32
+  timeout: 1000.0
+  health_timeout: 1800.0
+  health_poll_interval: 10.0
+  debug: true
+
+images:
+  vllm:
+    repo: atlaie/cc-deep-eval
+    tag: v0.0.25
+    digest: sha256:f0f9ed90dba0a4860b4d4ec5d758d20b97d900b7d48d90d470ebd4757ba06f8e
+    has_v1: true
+    model: glm-5-1-fp8
+
+cells:
+  # ============ CC-off arm — group (vllm, off, debug) ============
+
+  - cell_id: C1-off-t32
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    driver: stream
+    req_rate: 0.15
+    n_requests: 100
+    max_new_tokens: 32
+
+  - cell_id: C1-off-t128
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    driver: stream
+    req_rate: 0.15
+    n_requests: 100
+    max_new_tokens: 128
+
+  - cell_id: C1-off-t512
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    driver: stream
+    req_rate: 0.15
+    n_requests: 50
+    max_new_tokens: 512
+
+  - cell_id: C1-off-t1024
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    driver: stream
+    req_rate: 0.15
+    n_requests: 20
+    max_new_tokens: 1024
+
+  - cell_id: C1-off-t2048
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    driver: stream
+    req_rate: 0.15
+    n_requests: 10
+    max_new_tokens: 2048
+
+  # ============ CC-on arm — group (vllm, on, debug) ============
+
+  - cell_id: C1-on-t32
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    driver: stream
+    req_rate: 0.15
+    n_requests: 100
+    max_new_tokens: 32
+
+  - cell_id: C1-on-t128
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    driver: stream
+    req_rate: 0.15
+    n_requests: 100
+    max_new_tokens: 128
+
+  - cell_id: C1-on-t512
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    driver: stream
+    req_rate: 0.15
+    n_requests: 50
+    max_new_tokens: 512
+
+  - cell_id: C1-on-t1024
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    driver: stream
+    req_rate: 0.15
+    n_requests: 20
+    max_new_tokens: 1024
+
+  - cell_id: C1-on-t2048
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    driver: stream
+    req_rate: 0.15
+    n_requests: 10
+    max_new_tokens: 2048

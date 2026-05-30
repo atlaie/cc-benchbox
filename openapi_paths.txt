@@ -1,0 +1,10 @@
+/api/v2/
+/api/v2/api
+/api/v2/api_call
+/api/v2/forgot_password
+/api/v2/login
+/api/v2/metadata
+/api/v2/metadata_capnp
+/api/v2/register
+/api/v2/reset_password
+/api/v2/stream/{peer_uid}/{url_path}/

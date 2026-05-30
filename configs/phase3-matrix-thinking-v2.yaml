@@ -1,0 +1,75 @@
+# =====================================================================
+# phase3-matrix-thinking-v2.yaml
+# Tier 3G v2 — Robustness rerun of the GSM8K + enable_thinking sweep
+# =====================================================================
+#
+# This is a drop-in re-execution of phase3-matrix-thinking.yaml with
+# THREE differences from the original (and ONLY three):
+#
+#   1. defaults.timeout    600.0 → 1000.0   (eliminates the CC-on
+#      timeout at the longest pair, formerly pair_id 14 / tok_out ≈ 2272).
+#   2. benchbox.out_dir    runs/phase3 → runs/phase3_v2   (preserves
+#      the v1 parquets at runs/phase3/C_R-{off,on}/ for v1-vs-v2 diff).
+#   3. Cell-level `timeout: 1000.0` added explicitly so a future operator
+#      reading the cell block sees the budget without chasing defaults.
+#
+# Everything else — image digest, model, driver, req_rate, max_new_tokens,
+# enable_thinking, pairs file, n_requests, debug flag — is byte-identical
+# to the v1 config. The goal is one config diff between v1 and v2; any
+# behavioural difference is therefore attributable to deploy generation
+# alone (within the ±5–10% inter-deploy drift envelope) or to the timeout
+# bump itself (which only affects the upper tail).
+#
+# Brief reference: §4.2 (decode-phase localisation extrapolation check),
+# Figure 6.  Plan reference: ROBUSTNESS_PLAN.md §4.1.
+# ---------------------------------------------------------------------
+
+schema_version: 3
+
+org_subdomain: pour-demain
+tinfoil_host: control.inf8.tinfoil.sh
+
+benchbox:
+  scripts_dir: /Users/atlaie/prepilot/cc-benchbox
+  pairs_json: pairs-gsm8k.json   # SAME file as v1 — do not regenerate
+  out_dir: runs/phase3_v2
+
+defaults:
+  model: glm-5-1-fp8
+  n_requests: 100
+  max_new_tokens: 4096
+  timeout: 1200.0
+  health_timeout: 1800.0
+  health_poll_interval: 10.0
+  debug: true
+
+images:
+  vllm:
+    repo: atlaie/cc-deep-eval
+    tag: v0.0.25
+    digest: sha256:f0f9ed90dba0a4860b4d4ec5d758d20b97d900b7d48d90d470ebd4757ba06f8e
+    has_v1: true
+    model: glm-5-1-fp8
+
+cells:
+  - cell_id: C_R-off
+    condition: baseline
+    cc_state: off
+    image: vllm
+    driver: sequential
+    debug: true
+    req_rate: 0.15
+    max_new_tokens: 4096
+    timeout: 1000.0
+    enable_thinking: true
+
+  - cell_id: C_R-on
+    condition: baseline
+    cc_state: on
+    image: vllm
+    driver: sequential
+    debug: true
+    req_rate: 0.15
+    max_new_tokens: 4096
+    timeout: 1000.0
+    enable_thinking: true

@@ -1,0 +1,148 @@
+# =====================================================================
+# phase3-matrix-concurrency-sweep-v2.yaml
+# §4.4 of ROBUSTNESS_PLAN.md — Concurrency sweep replication
+# =====================================================================
+#
+# Drop-in re-execution of phase3-matrix-concurrency-sweep.yaml with
+# THREE differences from v1:
+#
+#   1. benchbox.out_dir: runs/phase3/concurrency_sweep_n500
+#      →  runs/phase3_v2/concurrency_sweep_n500     (preserves v1)
+#   2. c=128 cells removed. The brief intentionally excludes c=128
+#      from the headline finding ("engine-saturation behaviour ...
+#      outside the unsaturated regime characterised here", §4.3),
+#      and the plan specifies c ∈ {8, 16, 32, 64}. Replicate that range.
+#   3. Header docstring updated to reference the robustness plan.
+#
+# Everything else — image digest, pairs file, n=500, req_rate per cell,
+# driver=concurrent, stream=true, timeout, defaults — is byte-identical
+# to v1. The goal is one config diff; any behavioural difference in v2
+# is therefore attributable to deploy generation alone (within the
+# ±5–10% inter-deploy drift envelope documented in brief §3 / §4.3).
+#
+# Grouping (v3): 8 cells → 2 deploys.
+#   group (vllm, off, debug): C1-off-c{8,16,32,64}
+#   group (vllm, on,  debug): C1-on-c{8,16,32,64}
+# Re-running all 4 c-levels inside each fresh deploy avoids inter-deploy
+# drift confounding the c-trend.
+#
+# Brief reference: §4.3 (regime invariance, Figure 4), Appendix F Table A3.
+# Plan reference:  ROBUSTNESS_PLAN.md §4.4.
+# ---------------------------------------------------------------------
+
+org_subdomain: pour-demain
+tinfoil_host: control.inf8.tinfoil.sh
+
+benchbox:
+  scripts_dir: .
+  pairs_json: pairs-500.json                       # SAME file as v1 — do not regenerate
+  pairs_jsonl: pairs.jsonl
+  out_dir: runs/phase3_v2/concurrency_sweep_n500
+
+defaults:
+  n_requests: 500
+  max_new_tokens: 32
+  timeout: 1500.0
+  health_timeout: 3600
+  health_poll_interval: 10.0
+  metrics_interval: 0
+  model: glm-5-1-fp8
+  capture_target_logs: true
+  gpu_memory_interval: 5.0
+  ssh_user: tinfoil
+
+images:
+  vllm:
+    repo: atlaie/cc-deep-eval
+    tag: v0.0.25
+    digest: sha256:f0f9ed90dba0a4860b4d4ec5d758d20b97d900b7d48d90d470ebd4757ba06f8e
+    has_v1: true
+    model: glm-5-1-fp8
+
+cells:
+  # NOTE: cc_state values MUST be quoted ("on"/"off"). PyYAML 1.1 parses
+  # bare on/off as booleans.
+
+  # ============ CC-off arm — group (vllm, off, debug) ============
+
+  - cell_id: C1-off-c8
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    req_rate: 8.0
+    driver: concurrent
+    concurrency: 8
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-off-c16
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    req_rate: 16.0
+    driver: concurrent
+    concurrency: 16
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-off-c32
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    req_rate: 32.0
+    driver: concurrent
+    concurrency: 32
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-off-c64
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    req_rate: 64.0
+    driver: concurrent
+    concurrency: 64
+    n_requests: 500
+    stream: true
+
+  # ============ CC-on arm — group (vllm, on, debug) ============
+
+  - cell_id: C1-on-c8
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    req_rate: 8.0
+    driver: concurrent
+    concurrency: 8
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-on-c16
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    req_rate: 16.0
+    driver: concurrent
+    concurrency: 16
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-on-c32
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    req_rate: 32.0
+    driver: concurrent
+    concurrency: 32
+    n_requests: 500
+    stream: true
+
+  - cell_id: C1-on-c64
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    req_rate: 64.0
+    driver: concurrent
+    concurrency: 64
+    n_requests: 500
+    stream: true
