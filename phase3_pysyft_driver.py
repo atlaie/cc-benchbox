@@ -284,6 +284,7 @@ def call_endpoint(
     *,
     steering_direction: Optional[np.ndarray] = None,
     max_new_tokens: int = 32,
+    routing_layers: Optional[list] = None,
 ) -> dict:
     """Dispatch one call. Returns the raw endpoint result dict."""
     svc = client.api.services.prepilot
@@ -292,9 +293,12 @@ def call_endpoint(
             prompt=prompt, max_new_tokens=max_new_tokens,
         )
     if endpoint == "capture_routing":
-        return svc.capture_routing(
-            prompt=prompt, max_new_tokens=max_new_tokens,
-        )
+        # routing across all 75 MoE layers exceeds the debug shim's ~60s
+        # result-return ceiling; passing a layer subset keeps the call under it.
+        kwargs = {"prompt": prompt, "max_new_tokens": max_new_tokens}
+        if routing_layers:
+            kwargs["layers"] = routing_layers
+        return svc.capture_routing(**kwargs)
     if endpoint == "capture_attention_stats":
         return svc.capture_attention_stats(
             prompt=prompt, max_new_tokens=max_new_tokens,
@@ -355,6 +359,7 @@ def send_one(
     *,
     steering_direction: Optional[np.ndarray] = None,
     max_new_tokens: int = 32,
+    routing_layers: Optional[list] = None,
 ) -> PysyftRow:
     t_send = time.time()
     t_perf_start = time.perf_counter()
@@ -364,7 +369,8 @@ def send_one(
         raw = _unwrap_pysyft_result(
             call_endpoint(client, endpoint, prompt,
                           steering_direction=steering_direction,
-                          max_new_tokens=max_new_tokens)
+                          max_new_tokens=max_new_tokens,
+                          routing_layers=routing_layers)
         )
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
@@ -464,6 +470,7 @@ def run_cell(
     *,
     steering_direction: Optional[np.ndarray] = None,
     max_new_tokens: int = 32,
+    routing_layers: Optional[list] = None,
 ) -> list[PysyftRow]:
     """Round-robin through endpoints x prompts. Throttled by send-to-send
     interval. Total calls = len(endpoints) * len(prompts) when prompts is
@@ -483,6 +490,7 @@ def run_cell(
                 cell_id, cc_state,
                 steering_direction=steering_direction,
                 max_new_tokens=max_new_tokens,
+                routing_layers=routing_layers,
             )
             rows.append(row)
             tag = f"{endpoint} pair={pair_id} {prompt_class}"
@@ -631,6 +639,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--req-rate", type=float, default=0.15,
                    help="Target requests/sec across all endpoints, sequential.")
     p.add_argument("--max-new-tokens", type=int, default=32)
+    p.add_argument("--routing-layers", default=None,
+                   help="Comma-separated MoE layer indices (3..77) for "
+                        "capture_routing, e.g. '12,23,39,51,62,70'. Default (None) "
+                        "captures all 75 MoE layers, which can exceed the debug "
+                        "shim's ~60s result-return ceiling; pass a subset to stay "
+                        "under it. Ignored for non-routing endpoints.")
     p.add_argument("--steering-direction", type=Path, default=None,
                    help="Path to direction_L62.npy. Required if apply_steering is "
                         "in --endpoints.")
@@ -687,6 +701,20 @@ def main() -> int:
         print(f"[error] unknown endpoints: {unknown}; valid={ENDPOINTS}",
               file=sys.stderr)
         return 2
+
+    # Parse --routing-layers "12,23,..." -> [12,23,...]; validate 3..77.
+    if isinstance(args.routing_layers, str):
+        try:
+            args.routing_layers = [int(x) for x in args.routing_layers.split(",") if x.strip()]
+        except ValueError:
+            print(f"[error] --routing-layers must be comma-separated ints",
+                  file=sys.stderr)
+            return 2
+        bad = [L for L in args.routing_layers if not (3 <= L <= 77)]
+        if bad:
+            print(f"[error] --routing-layers out of MoE range [3,77]: {bad}",
+                  file=sys.stderr)
+            return 2
 
     steering_direction = None
     if "apply_steering" in endpoints:
@@ -746,6 +774,7 @@ def main() -> int:
             args.cell_id, args.cc_state,
             steering_direction=steering_direction,
             max_new_tokens=args.max_new_tokens,
+            routing_layers=args.routing_layers,
         )
         print(f"[run] complete in {(time.monotonic()-t0)/60:.1f} min")
 
