@@ -52,7 +52,7 @@ Edit anything (e.g. bump `ARG VLLM_VERSION` in `Dockerfile`), get it merged to `
 ## File map
 
 - [`Dockerfile`](./Dockerfile) — image contents (`vllm[bench]`, `guidellm`, dev tools)
-- [`tinfoil-config.yml`](./tinfoil-config.yml) — enclave resources (128 CPU / 1 TiB / 1 GPU, `cvm-version: 0.8.0`). Bump `gpus` to 8 for multi-GPU bench.
+- [`tinfoil-config.yml`](./configs/tinfoil-config.yml) — enclave resources (128 CPU / 1 TiB / 1 GPU, `cvm-version: 0.8.0`). Bump `gpus` to 8 for multi-GPU bench.
 - [`CLAUDE.md`](./CLAUDE.md) — bench workflow + metrics; baked into the image at `/workspace/CLAUDE.md`
 - [`release.sh`](./release.sh) — one-shot release script (build + measure + watch)
 - [`.github/workflows/`](./.github/workflows) — `tinfoil-build.yml` + `tinfoil-release.yml`
