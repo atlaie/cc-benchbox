@@ -1,6 +1,6 @@
 # cc-benchbox
 
-Measurement harness for [*An empirical study of Confidential Compute for frontier AI evaluations*](https://pourdemain.ngo/research) (Pour Demain, May 2026). This repo contains the laptop-side drivers, matrix orchestrator, analysis scripts, and prompt data that produced the results in the technical brief.
+Measurement harness for [*An empirical study of Confidential Compute for frontier AI evaluations*](https://pourdemain.ngo/) (Pour Demain, May 2026). This repo contains the laptop-side drivers, matrix orchestrator, analysis scripts, and prompt data that produced the results in the technical brief.
 
 The companion repo [`cc-deep-eval`](https://github.com/pourdemain/cc-deep-eval) contains the Tinfoil-deployed vLLM target images, vllm-lens plugin, PySyft Datasite server, and server-side endpoint definitions.
 
@@ -152,4 +152,4 @@ TDX and H200 SXM. Pour Demain Technical Brief.
 
 ## License
 
-[TODO: confirm license]
+Creative Commons Attribution 4.0 International (CC-BY-4.0)
