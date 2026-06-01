@@ -4,7 +4,7 @@ Measurement harness for [*An empirical study of Confidential Compute for frontie
 
 The companion repo [`cc-deep-eval`](https://github.com/pourdemain/cc-deep-eval) contains the Tinfoil-deployed vLLM target images, vllm-lens plugin, PySyft Datasite server, and server-side endpoint definitions.
 
-Run data (parquet + JSON) is archived at [Zenodo: TODO-DOI](https://zenodo.org/TODO).
+Run data (parquet + JSON) is archived at [Zenodo: 10.5281/zenodo.20499186](https://doi.org/10.5281/zenodo.20499186).
 
 ## What this repo does
 
