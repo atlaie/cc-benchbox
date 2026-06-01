@@ -1,0 +1,16 @@
+{
+  "max_tokens_cells": [
+    ["tok32",   "C1-off-t32",   "C1-on-t32"],
+    ["tok128",  "C1-off-t128",  "C1-on-t128"],
+    ["tok512",  "C1-off-t512",  "C1-on-t512"],
+    ["tok1024", "C1-off-t1024", "C1-on-t1024"],
+    ["tok2048", "C1-off-t2048", "C1-on-t2048"]
+  ],
+  "tokens_in_cells": [
+    ["in100",  "sweep_tok_in/CI-off-i100",  "sweep_tok_in/CI-on-i100"],
+    ["in500",  "sweep_tok_in/CI-off-i500",  "sweep_tok_in/CI-on-i500"],
+    ["in1000", "sweep_tok_in/CI-off-i1000", "sweep_tok_in/CI-on-i1000"],
+    ["in4000", "sweep_tok_in/CI-off-i4000", "sweep_tok_in/CI-on-i4000"],
+    ["in8000", "sweep_tok_in/CI-off-i8000", "sweep_tok_in/CI-on-i8000"]
+  ]
+}

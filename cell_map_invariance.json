@@ -1,0 +1,15 @@
+{
+  "Dispatch regime (GLM-MoE baseline)": [
+    ["sequential", "C1-off", "C1-on"],
+    ["streaming", "C1-off-stream", "C1-on-stream"],
+    ["concurrent c=8", "C1-off-c8", "C1-on-c8"]
+  ],
+  "Architecture (TP=8, sequential)": [
+    ["GLM-MoE", "C1-off", "C1-on"],
+    ["Llama-70B-dense", "C0-off", "C0-on"]
+  ],
+  "Tensor parallelism (Llama-70B-dense, sequential)": [
+    ["TP=8", "C0-off", "C0-on"],
+    ["TP=1", "C0-off-tp1", "C0-on-tp1"]
+  ]
+}

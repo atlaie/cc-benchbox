@@ -624,6 +624,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--admin-email", default="info@openmined.org")
     p.add_argument("--admin-password", default="changethis")
 
+    p.add_argument("--auditor-email", default=None,
+                   help="If set, dispatch runs as this auditor identity "
+                        "(DATA_SCIENTIST role) instead of admin. Admin creds "
+                        "are still used for --register-endpoints and "
+                        "--register-v2-endpoint. Requires the identity-gated "
+                        "endpoint (capture_residual_stream_v2) to be registered "
+                        "with this email in authorized_auditors.")
+    p.add_argument("--auditor-password", default=None,
+                   help="Password for --auditor-email.")
+    p.add_argument("--register-v2-endpoint", action="store_true",
+                   help="Delete the old TwinAPIEndpoint for "
+                        "capture_residual_stream and register the identity-gated "
+                        "v2 endpoint. Requires capture_residual_stream_v2.py "
+                        "on PYTHONPATH or in cwd.")
+
     p.add_argument("--pairs-json", type=Path, required=True)
     p.add_argument("--n-requests", type=int, default=50,
                    help="Total paired prompts (toxic+benign interleaved) sent to "
@@ -689,6 +704,47 @@ def _register_endpoints(client) -> None:
     try:
         n = len(client.custom_api.api_endpoints())
         print(f"[register] endpoints now visible: {n}", flush=True)
+    except Exception:
+        pass
+
+
+def _register_v2_endpoint(client) -> None:
+    """Delete old TwinAPIEndpoint for capture_residual_stream and register
+    the identity-gated v2 endpoint. Uses positional delete arg to avoid
+    PySyft's path kwarg collision."""
+    try:
+        from capture_residual_stream_v2 import build_endpoint
+    except ImportError:
+        try:
+            # Try cc-deep-eval path
+            from pysyft_endpoints.endpoints.capture_residual_stream_v2 import build_endpoint
+        except ImportError as e:
+            print(f"[register-v2][error] cannot import capture_residual_stream_v2: {e}\n"
+                  f"  place capture_residual_stream_v2.py in cwd or on PYTHONPATH",
+                  file=sys.stderr)
+            raise
+
+    # Delete old (positional arg — PySyft kwarg collision on 'path')
+    try:
+        client.custom_api.delete("prepilot.capture_residual_stream")
+        print("[register-v2] deleted old TwinAPIEndpoint", flush=True)
+    except Exception as e:
+        print(f"[register-v2] delete old: {type(e).__name__}: {e} (continuing)",
+              flush=True)
+
+    # Register new
+    try:
+        ep = build_endpoint()
+        res = client.custom_api.add(endpoint=ep)
+        print(f"[register-v2] registered identity-gated endpoint: "
+              f"{type(res).__name__}", flush=True)
+    except Exception as e:
+        print(f"[register-v2] FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+        raise
+
+    try:
+        eps = client.custom_api.api_endpoints()
+        print(f"[register-v2] endpoints now visible: {len(eps)}", flush=True)
     except Exception:
         pass
 
@@ -768,9 +824,33 @@ def main() -> int:
             _register_endpoints(client)
             client.refresh()
 
+        if args.register_v2_endpoint:
+            _register_v2_endpoint(client)
+            client.refresh()
+
+        # If --auditor-email is set, login as auditor for dispatch.
+        # Admin client was used for registration above; auditor client
+        # is used for the actual measurement sweep.
+        dispatch_client = client  # default: admin
+        if args.auditor_email:
+            if not args.auditor_password:
+                print("[error] --auditor-password required with --auditor-email",
+                      file=sys.stderr)
+                return 2
+            print(f"[cell] logging in as auditor: {args.auditor_email}")
+            if args.no_proxy:
+                dispatch_client = login_via_bearer(
+                    args.datasite_url, args.bearer or "",
+                    args.auditor_email, args.auditor_password)
+            else:
+                dispatch_client = login_via_proxy(
+                    args.proxy_port, args.auditor_email, args.auditor_password)
+            dispatch_client.refresh()
+            print(f"[cell] dispatch will run as: {args.auditor_email}")
+
         t0 = time.monotonic()
         rows = run_cell(
-            client, endpoints, prompts, args.req_rate,
+            dispatch_client, endpoints, prompts, args.req_rate,
             args.cell_id, args.cc_state,
             steering_direction=steering_direction,
             max_new_tokens=args.max_new_tokens,
@@ -782,6 +862,7 @@ def main() -> int:
             rows,
             cell_id=args.cell_id, cc_state=args.cc_state,
             datasite_url=args.datasite_url, image_digest=args.image_digest,
+            dispatch_identity=args.auditor_email or args.admin_email,
             transport=("verified_proxy" if not args.no_proxy else "direct_bearer"),
             endpoints=endpoints, req_rate=args.req_rate,
             n_requests_per_endpoint=args.n_requests,

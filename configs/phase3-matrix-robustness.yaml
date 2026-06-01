@@ -1,0 +1,81 @@
+# =====================================================================
+# phase3-matrix-thinking.yaml
+# Tier 3G — Reasoning prompts with enable_thinking=true
+# =====================================================================
+#
+# Tests whether the +30% CC delta holds at long realised outputs.
+# GLM-5.1's reasoning mode (`chat_template_kwargs.enable_thinking=true`)
+# emits a <think>...</think> chain-of-thought block before the final
+# answer; on GSM8K, thinking traces typically run 200-1500+ tokens, far
+# longer than the t2048 sweep peak (p50=958).
+#
+# Hypothesis: linear fit `wall = 0.47 + 275.2·t/1000` (from Tier 1A
+# phase-decomposition, R²=0.9999) extrapolates cleanly through ~5000
+# realised output tokens. CC delta stays in the +30-32% band.
+#
+# Group key: (vllm, off|on, true). 2 cells → 2 deploys via v3 grouping.
+# ---------------------------------------------------------------------
+
+
+
+org_subdomain: pour-demain
+tinfoil_host: control.inf8.tinfoil.sh
+
+benchbox:
+  scripts_dir: .
+  pairs_json: data/pairs-660.json
+  out_dir: runs/phase3_robustness
+
+defaults:
+  n_requests: 660
+  max_new_tokens: 32
+  timeout: 900.0
+  health_timeout: 3600
+  health_poll_interval: 10.0
+  model: glm-5-1-fp8
+  debug: true
+
+images:
+  vllm:
+    repo: atlaie/cc-deep-eval
+    tag: v0.0.25
+    digest: sha256:f0f9ed90dba0a4860b4d4ec5d758d20b97d900b7d48d90d470ebd4757ba06f8e
+    has_v1: true
+    model: glm-5-1-fp8
+
+cells:
+  # ---- Deploy 1: CC-off, debug, generation A ----
+  - cell_id: R1-D1-off
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    req_rate: 0.15
+
+  # ---- Deploy 2: CC-on, debug, generation A ----
+  - cell_id: R1-D1-on
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    req_rate: 0.15
+
+  # ---- Deploy 3: CC-off, debug, generation B ----
+  - cell_id: R1-D2-off
+    condition: baseline
+    cc_state: "off"
+    image: vllm
+    req_rate: 0.15
+
+  # ---- Deploy 4: CC-on, debug, generation B ----
+  - cell_id: R1-D2-on
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    req_rate: 0.15
+
+  # ---- Deploy 5: CC-on, attestation-on (production mode) ----
+  - cell_id: R1-D3-on-attest
+    condition: baseline
+    cc_state: "on"
+    image: vllm
+    req_rate: 0.15
+    debug: false

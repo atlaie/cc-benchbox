@@ -1,0 +1,10 @@
+{
+  "baseline c=8":  [["concurrency_sweep/C1-off-c8",  "concurrency_sweep/C1-on-c8"],
+                     ["concurrency_sweep_n500/C1-off-c8",  "concurrency_sweep_n500/C1-on-c8"]],
+  "baseline c=16": [["concurrency_sweep/C1-off-c16", "concurrency_sweep/C1-on-c16"],
+                     ["concurrency_sweep_n500/C1-off-c16", "concurrency_sweep_n500/C1-on-c16"]],
+  "baseline c=32": [["concurrency_sweep/C1-off-c32", "concurrency_sweep/C1-on-c32"],
+                     ["concurrency_sweep_n500/C1-off-c32", "concurrency_sweep_n500/C1-on-c32"]],
+  "baseline c=64": [["concurrency_sweep/C1-off-c64", "concurrency_sweep/C1-on-c64"],
+                     ["concurrency_sweep_n500/C1-off-c64", "concurrency_sweep_n500/C1-on-c64"]]
+}

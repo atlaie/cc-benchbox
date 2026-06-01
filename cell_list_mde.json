@@ -1,0 +1,13 @@
+[
+  ["baseline (GLM-MoE, seq)", "C1-off", "C1-on"],
+  ["repe_bundle", "C2-off", "C2-on"],
+  ["routing", "C4-off", "C4-on"],
+  ["steering", "C5-off", "C5-on"],
+  ["gradient", "C3-off", "C3-on"],
+  ["dense TP=8", "C0-off", "C0-on"],
+  ["dense TP=1", "C0-off-tp1", "C0-on-tp1"],
+  ["baseline streaming", "C1-off-stream", "C1-on-stream"],
+  ["baseline c=8", "C1-off-c8", "C1-on-c8"],
+  ["baseline attest", "C1-off-attest", "C1-on-attest"],
+  ["HarmBench", "C6-off", "C6-on"]
+]

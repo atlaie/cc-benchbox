@@ -1,33 +1,42 @@
+# Secrets
 .env
-.env.local
-.DS_Store
-results/
-runs/
-# Caches / virtualenv / OS noise
-.venv/
-__pycache__/
-.harmbench_cache/
-.DS_Store
+.env.*
 
-# Runtime artifacts (regenerable)
-runs/
-figures/
-*.log
-
-# Editor / backup
-*.bak
-*.patch
-
-# === cleanup_structural.sh additions ===
+# Python
 __pycache__/
 *.pyc
 *.pyo
-*.bak
-.DS_Store
-.ipynb_checkpoints/
 .venv/
 venv/
-.env
-__pycache__/
-*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Run data (archived separately on Zenodo)
+runs/
+
+# Runtime artifacts
+*.log
+
+# Editor backups
+*.bak
+
+# One-off patches (applied and done)
+patches/
+
+# Probe output (ephemeral)
 probe_*.json
+
+# Cell/deploy maps (run-specific, not reusable)
+cell_list_*.json
+cell_map_*.json
+deploy_map_*.json
+.harmbench_cache/
+figures/
